@@ -1,6 +1,8 @@
 #include "llama-kv-stream-config.h"
 #include "testing.h"
 
+#include <initializer_list>
+
 int main() {
     testing t;
 
@@ -17,7 +19,6 @@ int main() {
         config.minimum_arena_bytes = 1664ULL*256ULL;
         config.arch_qwen35        = true;
         config.context_default    = true;
-        config.single_sequence    = true;
         config.flash_attention    = true;
         config.kv_offload         = true;
 
@@ -32,7 +33,6 @@ int main() {
         base.minimum_arena_bytes = 1664ULL*256ULL;
         base.arch_qwen35         = true;
         base.context_default     = true;
-        base.single_sequence     = true;
         base.flash_attention     = true;
         base.kv_offload          = true;
 
@@ -48,8 +48,11 @@ int main() {
         config.context_default = false;
         expect_invalid("draft/MTP context", config);
         config = base;
-        config.single_sequence = false;
-        expect_invalid("parallel sequences", config);
+        config.n_seq_max = 2;
+        expect_invalid("parallel sequences without unified KV", config);
+        config = base;
+        config.n_seq_max = 0;
+        expect_invalid("zero sequences", config);
         config = base;
         config.flash_attention = false;
         expect_invalid("Flash Attention disabled", config);
@@ -58,6 +61,31 @@ int main() {
         expect_invalid("KV offload disabled", config);
         config.arena_bytes = config.minimum_arena_bytes - 1;
         expect_invalid("arena below its minimum", config);
+    });
+
+    t.test("parallel streaming uses a unified cache", [](testing & t) {
+        llama_kv_stream_config config;
+        config.arena_bytes = 64ULL*1024ULL*1024ULL;
+        config.minimum_arena_bytes = 1;
+        config.arch_qwen35 = config.context_default = true;
+        config.flash_attention = config.kv_offload = true;
+        config.kv_unified = true;
+        for (uint32_t slots : { 1U, 2U, 4U }) {
+            config.n_seq_max = slots;
+            const auto result = llama_kv_stream_config_validate(config);
+            t.assert_true("unified sequence count accepted", result.valid && result.enabled);
+        }
+    });
+
+    t.test("generation allows inactive slots but rejects speculative shapes", [](testing & t) {
+        t.assert_true("serial generation", llama_kv_stream_generation_batch_supported(1, 1, 1, 1));
+        t.assert_true("one of two slots", llama_kv_stream_generation_batch_supported(1, 1, 1, 2));
+        t.assert_true("two active slots", llama_kv_stream_generation_batch_supported(2, 2, 1, 2));
+        t.assert_true("two of four slots", llama_kv_stream_generation_batch_supported(2, 2, 1, 4));
+        t.assert_true("empty batch rejected", !llama_kv_stream_generation_batch_supported(0, 0, 1, 2));
+        t.assert_true("draft tokens rejected", !llama_kv_stream_generation_batch_supported(2, 1, 2, 2));
+        t.assert_true("too many sequences rejected", !llama_kv_stream_generation_batch_supported(3, 3, 1, 2));
+        t.assert_true("shared sequence token rejected", !llama_kv_stream_generation_batch_supported(1, 2, 1, 2));
     });
 
     t.test("pool is partitioned evenly across layers with one scratch page", [](testing & t) {

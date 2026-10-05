@@ -303,6 +303,8 @@ if (GGML_CUDA)
     llama_build_and_test(test-kv-stream-cuda-buffer.cpp LABEL cuda)
     llama_build_and_test(test-kv-stream-cuda-attn.cpp LABEL cuda)
     llama_build_and_test(test-kv-stream-cuda-set-rows.cpp LABEL cuda)
+    # Invoked by the ramdisk runner with the user's GGUF, not by model-free CTest.
+    llama_build(test-kv-stream-multislot.cpp)
 endif()
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately

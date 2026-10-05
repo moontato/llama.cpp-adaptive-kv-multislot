@@ -9,7 +9,8 @@ struct llama_kv_stream_config {
 
     bool arch_qwen35     = false;
     bool context_default = false;
-    bool single_sequence = false;
+    uint32_t n_seq_max   = 1;
+    bool kv_unified      = false;
     bool flash_attention = false;
     bool kv_offload      = false;
 };
@@ -81,3 +82,7 @@ enum llama_kv_stream_phase {
 
 bool llama_kv_stream_phase_is_generation(
     llama_kv_stream_phase phase, uint32_t batch_tokens);
+
+bool llama_kv_stream_generation_batch_supported(
+    uint32_t batch_tokens, uint32_t unique_sequences,
+    uint32_t tokens_per_sequence, uint32_t max_sequences);

@@ -10,11 +10,33 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace {
+
+struct fp32_reference_scope {
+    std::string previous;
+    bool had_previous;
+    static void set(const char * value) {
+#ifdef _WIN32
+        GGML_ASSERT(_putenv_s("GGML_CUDA_KV_STREAM_FP32_REFERENCE", value ? value : "") == 0);
+#else
+        GGML_ASSERT((value ? setenv("GGML_CUDA_KV_STREAM_FP32_REFERENCE", value, 1) :
+            unsetenv("GGML_CUDA_KV_STREAM_FP32_REFERENCE")) == 0);
+#endif
+    }
+    fp32_reference_scope() {
+        const char * value = std::getenv("GGML_CUDA_KV_STREAM_FP32_REFERENCE");
+        had_previous = value != nullptr;
+        if (value) { previous = value; }
+        set("1");
+    }
+    ~fp32_reference_scope() { set(had_previous ? previous.c_str() : nullptr); }
+};
 
 constexpr int64_t HEAD_DIM = 256;
 constexpr int64_t N_KV_HEAD = 4;
@@ -405,8 +427,15 @@ std::vector<float> run_attention_layers(
 
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
     testing t;
+    if (argc > 2) {
+        std::fprintf(stderr, "usage: %s [test_regex]\n", argv[0]);
+        return 2;
+    }
+    if (argc == 2) {
+        t.set_filter(argv[1]);
+    }
 
     t.test("decode span tuner selects the faster measured mode per layout", [](testing & t) {
         ggml_cuda_kv_stream_span_tuner production_tuner;
@@ -451,6 +480,156 @@ int main() {
 
         tuner.observe(1.0, /* streamed = */ true, /* bounded = */ true);
         t.assert_true("selection remains stable until layout reset", !tuner.use_bounded());
+    });
+
+    t.test("unified Q5_1 histories remain isolated across dirty rows and holes", [](testing & t) {
+        constexpr int64_t n_kv = 1024;
+        constexpr int64_t n_batch = 2;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        auto inputs = make_inputs(n_kv, n_batch, n_kv - 1, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1);
+        for (int64_t query = 0; query < n_batch; ++query) {
+            for (int64_t row = 0; row < n_kv; ++row) {
+                const bool owned = row % 2 == query;
+                const bool occupied = row < (query == 0 ? 1023 : 513) && row % 31 != 17;
+                inputs.mask[query*n_kv + row] = ggml_fp32_to_fp16(owned && occupied ? 0.0f : -INFINITY);
+            }
+        }
+        auto changed = inputs;
+        const size_t row_bytes = ggml_row_size(GGML_TYPE_Q5_1, HEAD_DIM)*N_KV_HEAD;
+        std::vector<float> changed_values(HEAD_DIM*N_KV_HEAD, 2.0f);
+        std::vector<uint8_t> changed_row(row_bytes);
+        GGML_ASSERT(ggml_quantize_chunk(GGML_TYPE_Q5_1, changed_values.data(),
+            changed_row.data(), 0, N_KV_HEAD, HEAD_DIM, nullptr) == row_bytes);
+        for (int64_t row = 1; row < n_kv; row += 2) {
+            // Only sequence 1's V changes.
+            std::memcpy(changed.v.data() + row*row_bytes, changed_row.data(), row_bytes);
+        }
+        const size_t page_bytes = align_up(row_bytes*256, 128) + row_bytes*256;
+        auto streamed = [&](const attention_inputs & input) {
+            ggml_backend_cuda_kv_stream_params params{};
+            params.device = 0;
+            params.stage_bytes = page_bytes;
+            params.stage_slots = 2;
+            params.pool_bytes = 3*page_bytes;
+            params.resident_layer_count = 1;
+            params.page_tokens = 256;
+            auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+            if (!t.assert_true("unified test runtime initializes", runtime != nullptr)) {
+                return std::vector<float>{};
+            }
+            auto result = run_attention(
+                backend.get(), input, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+                n_kv, n_batch, 4, 2, true, GGML_TYPE_I64, true, runtime, true);
+            const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+            t.assert_true("test exceeds resident capacity", stats.streamed_pages > 0);
+            ggml_backend_cuda_kv_stream_runtime_free(runtime);
+            return result;
+        };
+        const auto actual = streamed(inputs);
+        const auto perturbed = streamed(changed);
+        for (int variant = 0; variant < 2; ++variant) {
+            const auto expected = run_attention(
+                backend.get(), variant == 0 ? inputs : changed,
+                ggml_backend_get_default_buffer_type(backend.get()),
+                n_kv, n_batch, 4, 2, true, GGML_TYPE_I64, true, nullptr, true);
+            const auto & output = variant == 0 ? actual : perturbed;
+            if (!t.assert_equal(expected.size(), output.size())) {
+                return;
+            }
+            float max_abs = 0.0f;
+            bool finite = true;
+            for (size_t i = 0; i < output.size(); ++i) {
+                finite &= std::isfinite(output[i]) && std::isfinite(expected[i]);
+                max_abs = std::max(max_abs, std::abs(output[i] - expected[i]));
+            }
+            std::fprintf(stderr, "unified Q5_1 variant=%d max_abs=%g\n", variant, max_abs);
+            t.assert_true("unified output finite and equivalent", finite && max_abs <= 5e-4f);
+        }
+        float isolated_difference = 0.0f;
+        float changed_difference = 0.0f;
+        for (size_t i = 0; i < HEAD_DIM*N_Q_HEAD; ++i) {
+            isolated_difference = std::max(isolated_difference, std::abs(actual[i] - perturbed[i]));
+            changed_difference = std::max(changed_difference,
+                std::abs(actual[i + HEAD_DIM*N_Q_HEAD] - perturbed[i + HEAD_DIM*N_Q_HEAD]));
+        }
+        t.assert_true("other history cannot affect sequence 0", isolated_difference <= 5e-4f);
+        t.assert_true("perturbation affects sequence 1", changed_difference > 0.5f);
+    });
+
+    t.test("Q5_1 prefill preserves constant values across long resident spans", [](testing & t) {
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        for (const int64_t n_kv : {int64_t(3072), int64_t(32768)}) {
+            const int64_t n_batch = n_kv == 3072 ? 127 : 128;
+            auto inputs = make_inputs(n_kv, n_batch, 0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1);
+            std::fill(inputs.q.begin(), inputs.q.end(), 0.0f);
+            for (int64_t query = 0; query < n_batch; ++query) {
+                for (int64_t token = 0; token < n_kv; ++token) {
+                    // SET_ROWS changes row 0; exclude it from the analytic answer.
+                    const bool visible = token > 0 && token <= n_kv - n_batch - 1 + query;
+                    inputs.mask[query*n_kv + token] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                }
+            }
+            const size_t head_bytes = ggml_row_size(GGML_TYPE_Q5_1, HEAD_DIM);
+            const size_t row_bytes = head_bytes*N_KV_HEAD;
+            std::vector<float> source(HEAD_DIM*N_KV_HEAD);
+            for (int64_t head = 0; head < N_KV_HEAD; ++head) {
+                for (int64_t value = 0; value < HEAD_DIM; ++value) {
+                    source[head*HEAD_DIM + value] = 0.7f + 0.1f*head + 0.005f*(value % 13);
+                }
+            }
+            std::vector<uint8_t> row(row_bytes);
+            GGML_ASSERT(ggml_quantize_chunk(GGML_TYPE_Q5_1, source.data(), row.data(),
+                0, N_KV_HEAD, HEAD_DIM, nullptr) == row_bytes);
+            for (int64_t token = 0; token < n_kv; ++token) {
+                std::memcpy(inputs.v.data() + token*row_bytes, row.data(), row_bytes);
+            }
+            std::vector<float> expected(HEAD_DIM*N_KV_HEAD);
+            for (int64_t head = 0; head < N_KV_HEAD; ++head) {
+                ggml_get_type_traits(GGML_TYPE_Q5_1)->to_float(
+                    row.data() + head*head_bytes, expected.data() + head*HEAD_DIM, HEAD_DIM);
+            }
+            for (float & value : expected) {
+                value = ggml_fp16_to_fp32(ggml_fp32_to_fp16(value));
+            }
+            const size_t page_bytes = align_up(row_bytes*256, 128) + row_bytes*256;
+            ggml_backend_cuda_kv_stream_params params{};
+            params.device = 0;
+            params.stage_bytes = page_bytes;
+            params.stage_slots = 2;
+            params.pool_bytes = (n_kv/256 + 1)*page_bytes;
+            params.resident_layer_count = 1;
+            params.page_tokens = 256;
+            auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+            if (!t.assert_true("long-span runtime initializes", runtime != nullptr)) {
+                return;
+            }
+            const auto actual = run_attention(backend.get(), inputs,
+                ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch);
+            const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+            ggml_backend_cuda_kv_stream_runtime_free(runtime);
+            t.assert_true("long-span test executes streamed MMA", stats.mma_prefill_attention_spans > 0 && stats.streamed_pages > 0);
+            if (!t.assert_equal(size_t(HEAD_DIM*N_Q_HEAD*n_batch), actual.size())) {
+                return;
+            }
+            float max_abs = 0.0f;
+            bool finite = true;
+            for (size_t i = 0; i < actual.size(); ++i) {
+                const size_t query_head = (i/HEAD_DIM) % N_Q_HEAD;
+                const size_t kv_head = query_head/(N_Q_HEAD/N_KV_HEAD);
+                const float reference = expected[kv_head*HEAD_DIM + i % HEAD_DIM];
+                finite &= std::isfinite(actual[i]);
+                max_abs = std::max(max_abs, std::abs(actual[i] - reference));
+            }
+            std::fprintf(stderr, "analytic Q5_1 prefill kv=%lld queries=%lld resident=%lld max_abs=%g finite=%d\n",
+                (long long) n_kv, (long long) n_batch, (long long) (n_kv - 256), max_abs, int(finite));
+            t.assert_true("constant values survive long-span prefill", finite && max_abs <= 5e-4f);
+        }
     });
 
     t.test("all native CUDA KV pairs preserve streamed prefill results", [](testing & t) {
@@ -725,7 +904,7 @@ int main() {
         t.assert_true("streamed output is numerically equivalent", max_abs <= 3e-4f);
     });
 
-    t.test("one-page causal prefill stays bit-identical to ordinary CUDA attention", [](testing & t) {
+    t.test("one-page causal prefill stays bit-identical to resident FP32 attention", [](testing & t) {
         constexpr int64_t n_kv = 256;
         constexpr int64_t n_batch = 5;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -734,8 +913,10 @@ int main() {
         }
 
         const attention_inputs inputs = make_inputs(n_kv, n_batch);
-        const std::vector<float> expected = run_attention(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+        const std::vector<float> expected = [&]() {
+            fp32_reference_scope reference_mode;
+            return run_attention(backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+        }();
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
@@ -759,7 +940,7 @@ int main() {
         t.assert_true("one-page outputs are bit-identical", expected == actual);
     });
 
-    t.test("fully resident multi-page prefill stays bit-identical to ordinary CUDA attention", [](testing & t) {
+    t.test("fully resident multi-page prefill stays bit-identical to resident FP32 attention", [](testing & t) {
         constexpr int64_t n_kv = 512;
         constexpr int64_t n_batch = 4;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -768,8 +949,10 @@ int main() {
         }
 
         const attention_inputs inputs = make_inputs(n_kv, n_batch, 340);
-        const std::vector<float> expected = run_attention(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+        const std::vector<float> expected = [&]() {
+            fp32_reference_scope reference_mode;
+            return run_attention(backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+        }();
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;

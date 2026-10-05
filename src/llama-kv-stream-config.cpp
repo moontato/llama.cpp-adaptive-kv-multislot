@@ -17,8 +17,11 @@ llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_str
     if (!config.context_default) {
         return invalid("block KV streaming currently supports only the target context, not MTP/draft contexts");
     }
-    if (!config.single_sequence) {
-        return invalid("block KV streaming requires exactly one sequence (-np 1)");
+    if (config.n_seq_max == 0) {
+        return invalid("block KV streaming requires at least one sequence");
+    }
+    if (config.n_seq_max > 1 && !config.kv_unified) {
+        return invalid("block KV streaming with parallel sequences requires --kv-unified");
     }
     if (!config.flash_attention) {
         return invalid("block KV streaming requires Flash Attention");
@@ -31,6 +34,13 @@ llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_str
     }
 
     return { true, true, {} };
+}
+
+bool llama_kv_stream_generation_batch_supported(
+        uint32_t batch_tokens, uint32_t unique_sequences,
+        uint32_t tokens_per_sequence, uint32_t max_sequences) {
+    return batch_tokens > 0 && batch_tokens <= max_sequences &&
+        unique_sequences == batch_tokens && tokens_per_sequence == 1;
 }
 
 llama_kv_stream_pool_layout llama_kv_stream_pool_layout_make(

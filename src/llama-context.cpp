@@ -396,7 +396,8 @@ llama_context::llama_context(
             /*.minimum_arena_bytes =*/ kv_stream_arena_bytes == 0 ? uint64_t(0) : uint64_t(1),
             /*.arch_qwen35         =*/ model.arch == LLM_ARCH_QWEN35,
             /*.context_default     =*/ cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT,
-            /*.single_sequence     =*/ cparams.n_seq_max == 1,
+            /*.n_seq_max           =*/ cparams.n_seq_max,
+            /*.kv_unified          =*/ cparams.kv_unified,
             /*.flash_attention     =*/ cparams.flash_attn,
             /*.kv_offload          =*/ cparams.offload_kqv,
         };
@@ -840,17 +841,21 @@ bool llama_context::kv_stream_switch_phase(
     }
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = decode ?
-        n_seqs : std::min(cparams.n_ctx, cparams.n_ubatch);
-    const uint32_t n_outputs = decode ?
-        n_seqs : std::min(n_tokens, cparams.n_outputs_max);
-    auto * gf = graph_reserve(
-        n_tokens, n_seqs, n_outputs, reserve_mctx.get());
-    if (gf == nullptr) {
-        LLAMA_LOG_ERROR(
-            "%s: failed to reserve %s compute graph in phase arena\n",
-            __func__, decode ? "decode" : "prefill");
-        return false;
+    for (uint32_t active = 1; active <= n_seqs; ++active) {
+        const uint32_t n_tokens = decode ?
+            active : std::min(cparams.n_ctx, cparams.n_ubatch);
+        const uint32_t n_outputs = decode ?
+            active : std::min<uint64_t>(
+                std::min(n_tokens, cparams.n_outputs_max),
+                uint64_t(active)*cparams.n_outputs_max_per_seq);
+        auto * gf = graph_reserve(
+            n_tokens, active, n_outputs, reserve_mctx.get());
+        if (gf == nullptr) {
+            LLAMA_LOG_ERROR(
+                "%s: failed to reserve %s compute graph in phase arena\n",
+                __func__, decode ? "decode" : "prefill");
+            return false;
+        }
     }
 
     backend_buf_exp_size = target.backend_sizes;
@@ -933,21 +938,40 @@ void llama_context::sched_reserve() {
         std::vector<size_t> sizes_pp(backend_ptrs.size(), 0);
         std::vector<size_t> sizes_tg(backend_ptrs.size(), 0);
 
-        auto * gf_pp = graph_reserve(
-            n_tokens, n_seqs, n_outputs_pp, mctx.get(), true, sizes_pp.data());
-        if (gf_pp == nullptr) {
-            throw std::runtime_error("failed to measure compute pp buffers");
-        }
-        const int n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
-        const int n_nodes_pp = ggml_graph_n_nodes(gf_pp);
+        int n_splits_pp = 0;
+        int n_nodes_pp  = 0;
+        int n_splits_tg = 0;
+        int n_nodes_tg  = 0;
 
-        auto * gf_tg = graph_reserve(
-            n_seqs, n_seqs, n_seqs, mctx.get(), true, sizes_tg.data());
-        if (gf_tg == nullptr) {
-            throw std::runtime_error("failed to measure compute tg buffers");
+        // Partial batches may need additional recurrent-state copies.
+        // Reserve the largest workspace across active sequence counts in each phase.
+        for (uint32_t active = 1; active <= n_seqs; ++active) {
+            std::vector<size_t> measured(backend_ptrs.size(), 0);
+            const uint32_t active_outputs = std::min<uint64_t>(
+                n_outputs_pp, uint64_t(active)*cparams.n_outputs_max_per_seq);
+            auto * gf = graph_reserve(
+                n_tokens, active, active_outputs, mctx.get(), true, measured.data());
+            if (gf == nullptr) {
+                throw std::runtime_error("failed to measure compute pp buffers");
+            }
+            n_splits_pp = std::max(n_splits_pp, ggml_backend_sched_get_n_splits(sched.get()));
+            n_nodes_pp  = std::max(n_nodes_pp, ggml_graph_n_nodes(gf));
+            for (size_t i = 0; i < measured.size(); ++i) {
+                sizes_pp[i] = std::max(sizes_pp[i], measured[i]);
+            }
+
+            std::fill(measured.begin(), measured.end(), 0);
+            gf = graph_reserve(
+                active, active, active, mctx.get(), true, measured.data());
+            if (gf == nullptr) {
+                throw std::runtime_error("failed to measure compute tg buffers");
+            }
+            n_splits_tg = std::max(n_splits_tg, ggml_backend_sched_get_n_splits(sched.get()));
+            n_nodes_tg  = std::max(n_nodes_tg, ggml_graph_n_nodes(gf));
+            for (size_t i = 0; i < measured.size(); ++i) {
+                sizes_tg[i] = std::max(sizes_tg[i], measured[i]);
+            }
         }
-        const int n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
-        const int n_nodes_tg = ggml_graph_n_nodes(gf_tg);
 
         const uint64_t compute_alignment =
             ggml_backend_buft_get_alignment(backend_buft[backend_index]);
@@ -1792,10 +1816,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 const bool generation =
                     llama_kv_stream_phase_is_generation(
                         phase, ubatch.n_tokens);
-                if (kv_stream_phase_arena.configured && generation &&
-                        ubatch.n_tokens != cparams.n_seq_max) {
+                bool generation_supported = llama_kv_stream_generation_batch_supported(
+                    ubatch.n_tokens, ubatch.n_seqs_unq,
+                    ubatch.n_seq_tokens, cparams.n_seq_max);
+                for (uint32_t i = 0; generation_supported && i < ubatch.n_tokens; ++i) {
+                    generation_supported = ubatch.n_seq_id[i] == 1;
+                }
+                if (kv_stream_phase_arena.configured && generation && !generation_supported) {
                     LLAMA_LOG_ERROR(
-                        "%s: phase arena currently supports TG1 without speculative batches\n",
+                        "%s: phase arena generation requires one token per active sequence without speculative batches\n",
                         __func__);
                     ret = GGML_STATUS_FAILED;
                     return nullptr;

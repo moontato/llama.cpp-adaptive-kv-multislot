@@ -61,6 +61,18 @@ The arena value is the fixed total shared allocation, not just KV capacity. Its 
 
 llama.cpp's device-memory auto-fit dry run is bypassed when a nonzero arena is configured. The arena and supported single-GPU layer placement are already explicit, while the upstream no-allocation estimator cannot represent overlapping phase lifetimes. Real context initialization still measures both phase graphs and rejects an arena that cannot fit either layout.
 
+### Parallel slots with unified KV (experimental)
+
+With a nonzero phase arena, `--parallel 2 --kv-unified` shares one physical KV stream and adaptive CUDA pool across the two sequence histories. Sequence masks isolate attention; dirty-row tracking refreshes pages when either slot writes or reuses cache cells. The pool is shared by occupied cache rows, without fixed per-slot VRAM partitions. `--kv-unified` refers to llama.cpp's logical KV allocation, not CUDA Unified Memory.
+
+Generation batches may contain one token from each active slot, including a single active slot after the other finishes. Each phase reserves compute workspace across all active sequence counts. Mixed prompt/generation batches retain the conservative prompt workspace. Parallel streaming rejects speculative decoding, including MTP and ngram modes.
+
+For two slots that each admit a 250K prompt, configure aggregate capacity and a per-slot limit, for example `--ctx-size 524288 --parallel 2 --kv-unified --kv-unified-per-slot 262144 -ctk q5_1 -ctv q5_1`. Retain Flash Attention, GPU KV offload, and your known working arena size. The additional host KV capacity still consumes system RAM. Multi-query decode uses the existing streamed attention path; TG1 cross-layer lookahead does not imply equal throughput with two active slots.
+
+Eligible NVIDIA prefill attention with 256-dimensional heads uses FP32 value accumulation both before and after the first KV spill. The model tests compare cache behavior against a GPU-resident FP32 baseline and check selected attention rows against independent double-precision math. Ordinary CUDA precision differences remain visible in the reports.
+
+This patch targets `feature/kv-stream-phase-arena`, not the V2 fork. GPU validation of the current revision and long-context behavior is pending. See [the ramdisk test instructions](docs/kv-stream-multislot-testing.md) for the pinned build, CUDA tests, teacher-forced logit comparisons, server concurrency and state restore tests, and the optional long diagnostic. Two slots are the model-tested target; larger counts require further validation.
+
 ### Batch and micro-batch sizes
 
 `-b` sets the logical prompt batch size and `-ub` sets the largest physical batch submitted to one graph. This branch no longer requires `256/256`; `-ub` may be any positive value no larger than `-b`.

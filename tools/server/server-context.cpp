@@ -1022,6 +1022,12 @@ private:
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
+        if (params_base.kv_stream_arena_mib > 0 && params_base.n_parallel > 1 &&
+                common_speculative_n_max(&params_base.speculative) > 0) {
+            SRV_ERR("%s", "parallel block KV streaming does not support speculative decoding\n");
+            return false;
+        }
+
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
             if (has_spec) {

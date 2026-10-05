@@ -8,10 +8,26 @@
 #include "kv-stream-span-tuner.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <limits>
+#include <mutex>
+#include <sstream>
+#include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+
+enum best_fattn_kernel {
+    BEST_FATTN_KERNEL_NONE    =   0,
+    BEST_FATTN_KERNEL_TILE    = 200,
+    BEST_FATTN_KERNEL_VEC     = 100,
+    BEST_FATTN_KERNEL_MMA_F16 = 400,
+};
+
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(int device, const ggml_tensor * dst);
+static void ggml_cuda_flash_attn_ext_standard(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
@@ -227,6 +243,7 @@ struct ggml_cuda_kv_stream_transfer_ring {
     bool last_graph_bounded = false;
     bool last_graph_streamed = false;
     bool copy_sample_recorded = false;
+    std::vector<uint32_t> checked_query_shapes;
 };
 
 ggml_cuda_kv_stream_transfer_ring * ggml_cuda_kv_stream_transfer_ring_new(
@@ -1778,6 +1795,530 @@ uint32_t ggml_cuda_kv_stream_last_ring_peak_occupancy(
     return ring == nullptr ? 0 : ring->last_ring_peak_occupancy;
 }
 
+static bool kv_stream_fp32_mma_supported(int device, const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const int cc = ggml_cuda_info().devices[device].cc;
+    float max_bias, logit_softcap;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
+        Q->type == GGML_TYPE_F32 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+        Q->ne[1] > 1 && Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
+        Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8 &&
+        K->ne[1] % FATTN_KQ_STRIDE == 0 && mask != nullptr &&
+        mask->type == GGML_TYPE_F16 && dst->src[4] == nullptr &&
+        max_bias == 0.0f && logit_softcap == 0.0f &&
+        ggml_backend_cuda_kv_stream_get_attention_mode(K->type, V->type) == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT &&
+        ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_MMA_F16;
+}
+
+static void kv_stream_fp32_mma_resident(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int nrows = int(ggml_nelements(dst)/256);
+    ggml_cuda_pool_alloc<float> numerator(ctx.pool(), ggml_nelements(dst));
+    ggml_cuda_pool_alloc<float2> meta(ctx.pool(), nrows);
+    // One GPU-resident span uses no streaming ring, host cache or page merge.
+    ggml_cuda_flash_attn_ext_mma_f16_partial_case<256, 256, 8, 8>(ctx, dst, numerator.ptr, meta.ptr);
+    const ggml_cuda_kernel_launch_params launch_params(dim3(nrows, 1, 1), dim3(256, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(kv_stream_normalize_chunk_results<256>, launch_params,
+        numerator.ptr, meta.ptr, static_cast<float *>(dst->data), nrows);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+enum kv_stream_reference_mode {
+    KV_STREAM_REFERENCE_STOCK = 0,
+    KV_STREAM_REFERENCE_FP32 = 1,
+    KV_STREAM_REFERENCE_MMA_PARTS = 2,
+    KV_STREAM_REFERENCE_VEC_PARTS = 3,
+};
+
+struct kv_stream_reference_plan {
+    int mode = KV_STREAM_REFERENCE_STOCK;
+    int parts = 1;
+    int64_t queries = 0;
+    std::vector<std::pair<int64_t, int64_t>> spans;
+};
+
+static uint64_t kv_stream_reference_shape(const ggml_tensor * dst) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    auto append = [&](uint64_t value) {
+        for (int i = 0; i < 8; ++i) {
+            hash = (hash ^ (value & 255))*UINT64_C(1099511628211);
+            value >>= 8;
+        }
+    };
+    for (int i = -1; i < 5; ++i) {
+        const ggml_tensor * tensor = i == -1 ? dst : dst->src[i];
+        append(tensor == nullptr ? 0 : 1);
+        if (tensor != nullptr) {
+            append(tensor->type);
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) { append(tensor->ne[d]); }
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        uint32_t value;
+        memcpy(&value, reinterpret_cast<const char *>(dst->op_params) + i*sizeof(value), sizeof(value));
+        append(value);
+    }
+    return hash;
+}
+
+static void kv_stream_record_reference_plan(const ggml_tensor * dst, const kv_stream_reference_plan & plan) {
+    const char * path = getenv("GGML_CUDA_KV_STREAM_RECORD_PLAN");
+    if (path == nullptr) { return; }
+    GGML_ASSERT(getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+    GGML_ASSERT(ggml_backend_cuda_kv_stream_get_attention_mode(dst->src[1]->type, dst->src[2]->type) ==
+        GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT);
+    // Record arithmetic boundaries only. The reference owns its Q/K/V, mask and output.
+    std::ofstream output(path, std::ios::app);
+    GGML_ASSERT(output.good());
+    output << "1 " << kv_stream_reference_shape(dst) << ' ' << plan.mode << ' ' << plan.parts << ' '
+           << plan.queries << ' ' << plan.spans.size();
+    for (const auto & span : plan.spans) { output << ' ' << span.first << ' ' << span.second; }
+    output << '\n';
+    output.flush();
+    GGML_ASSERT(output.good());
+    GGML_LOG_INFO("kv_stream_plan_record: queries=%lld kv=%lld mode=%d spans=%zu file=%s\n",
+        (long long) dst->src[0]->ne[1], (long long) dst->src[1]->ne[1], plan.mode, plan.spans.size(), path);
+}
+
+static kv_stream_reference_plan kv_stream_read_reference_plan(const ggml_tensor * dst, const char * path) {
+    struct reader {
+        std::ifstream input;
+        size_t calls = 0;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<std::string, reader> readers;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto & source = readers[path];
+    if (!source.input.is_open()) { source.input.open(path); }
+    std::string line;
+    GGML_ASSERT(std::getline(source.input, line));
+    std::istringstream input(line);
+    int version;
+    uint64_t shape;
+    size_t spans;
+    kv_stream_reference_plan plan;
+    GGML_ASSERT(input >> version >> shape >> plan.mode >> plan.parts >> plan.queries >> spans);
+    GGML_ASSERT(version == 1 && shape == kv_stream_reference_shape(dst));
+    GGML_ASSERT(plan.mode >= KV_STREAM_REFERENCE_STOCK && plan.mode <= KV_STREAM_REFERENCE_VEC_PARTS);
+    GGML_ASSERT(plan.parts > 0 && plan.parts <= KV_STREAM_MAX_PARTS_PER_CHUNK);
+    GGML_ASSERT(plan.queries > 0 && plan.queries <= dst->src[0]->ne[1]);
+    GGML_ASSERT(spans > 0 && spans <= size_t(dst->src[1]->ne[1]/FATTN_KQ_STRIDE));
+    int64_t next = 0;
+    for (size_t i = 0; i < spans; ++i) {
+        int64_t begin, count;
+        GGML_ASSERT(input >> begin >> count);
+        GGML_ASSERT(begin == next && count > 0 && count % FATTN_KQ_STRIDE == 0);
+        GGML_ASSERT(count <= dst->src[1]->ne[1] - next);
+        plan.spans.emplace_back(begin, count);
+        next += count;
+    }
+    GGML_ASSERT(next == dst->src[1]->ne[1]);
+    std::string trailing;
+    GGML_ASSERT(!(input >> trailing));
+    GGML_LOG_INFO("kv_stream_plan_replay: call=%zu queries=%lld kv=%lld mode=%d spans=%zu file=%s\n",
+        ++source.calls, (long long) dst->src[0]->ne[1], (long long) dst->src[1]->ne[1],
+        plan.mode, plan.spans.size(), path);
+    return plan;
+}
+
+static void kv_stream_execute_reference_plan(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const kv_stream_reference_plan & plan) {
+    if (plan.mode == KV_STREAM_REFERENCE_STOCK || plan.mode == KV_STREAM_REFERENCE_FP32) {
+        GGML_ASSERT(plan.spans.size() == 1);
+        if (plan.mode == KV_STREAM_REFERENCE_FP32) {
+            GGML_ASSERT(kv_stream_fp32_mma_supported(ctx.device, dst));
+            kv_stream_fp32_mma_resident(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_standard(ctx, dst);
+        }
+        return;
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    GGML_ASSERT(Q->ne[0] == KV_STREAM_HEAD_DIM && V->ne[0] == KV_STREAM_HEAD_DIM);
+    GGML_ASSERT(Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1);
+    GGML_ASSERT(ggml_backend_cuda_kv_stream_get_attention_mode(K->type, V->type) ==
+        GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT);
+    const bool mma = plan.mode == KV_STREAM_REFERENCE_MMA_PARTS;
+    GGML_ASSERT(!mma || (plan.parts == 1 && kv_stream_fp32_mma_supported(ctx.device, dst)));
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+    const auto native_partial = kv_stream_resolve_native_partial(K->type, V->type);
+    GGML_ASSERT(mma || native_partial != nullptr);
+#else
+    GGML_ASSERT(mma);
+#endif
+    const int nrows = ggml_nrows(dst);
+    const int64_t rows_per_query = nrows/Q->ne[1];
+    const size_t workspace_rows = size_t(plan.queries*rows_per_query);
+    ggml_cuda_pool_alloc<float> parts(ctx.pool(), plan.parts*workspace_rows*dst->ne[0]);
+    ggml_cuda_pool_alloc<float2> meta(ctx.pool(), plan.parts*workspace_rows);
+    ggml_cuda_pool_alloc<float> accumulator(ctx.pool(), ggml_nelements(dst));
+    ggml_cuda_pool_alloc<float2> accumulator_meta(ctx.pool(), nrows);
+    for (size_t i = 0; i < plan.spans.size(); ++i) {
+        const auto & span = plan.spans[i];
+        ggml_tensor k = *K;
+        ggml_tensor v = *V;
+        k.data = static_cast<char *>(K->data) + span.first*K->nb[1];
+        v.data = static_cast<char *>(V->data) + span.first*V->nb[1];
+        k.ne[1] = v.ne[1] = span.second;
+        for (int64_t begin = 0; begin < Q->ne[1]; begin += plan.queries) {
+            const int64_t count = std::min(plan.queries, Q->ne[1] - begin);
+            ggml_tensor q = *Q;
+            q.data = static_cast<char *>(Q->data) + begin*Q->nb[1];
+            q.ne[1] = count;
+            ggml_tensor m{};
+            if (mask != nullptr) {
+                m = *mask;
+                m.data = static_cast<char *>(mask->data) + span.first*mask->nb[0] + begin*mask->nb[1];
+                m.ne[0] = span.second;
+                m.ne[1] = count;
+            }
+            ggml_tensor result = *dst;
+            result.ne[2] = count;
+            result.src[0] = &q;
+            result.src[1] = &k;
+            result.src[2] = &v;
+            result.src[3] = mask == nullptr ? nullptr : &m;
+            if (mma) {
+                ggml_cuda_flash_attn_ext_mma_f16_partial_case<256, 256, 8, 8>(ctx, &result, parts.ptr, meta.ptr);
+            } else {
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+                native_partial(ctx, &result, parts.ptr, meta.ptr, plan.parts);
+#endif
+            }
+            const int tile_rows = int(count*rows_per_query);
+            const size_t offset = size_t(begin*rows_per_query);
+            const ggml_cuda_kernel_launch_params launch(dim3(tile_rows, 1, 1), dim3(KV_STREAM_HEAD_DIM, 1, 1), 0, ctx.stream());
+            ggml_cuda_kernel_launch(kv_stream_accumulate_chunk_results<KV_STREAM_HEAD_DIM>, launch,
+                parts.ptr, meta.ptr, accumulator.ptr + offset*dst->ne[0], accumulator_meta.ptr + offset,
+                tile_rows, i == 0, plan.parts);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+    const ggml_cuda_kernel_launch_params launch(dim3(nrows, 1, 1), dim3(KV_STREAM_HEAD_DIM, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(kv_stream_normalize_chunk_results<KV_STREAM_HEAD_DIM>, launch,
+        accumulator.ptr, accumulator_meta.ptr, static_cast<float *>(dst->data), nrows);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void kv_stream_replay_reference_plan(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const char * path) {
+    GGML_ASSERT(getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+    for (int i : {1, 2}) {
+        const ggml_tensor * tensor = dst->src[i];
+        while (tensor->view_src != nullptr) { tensor = tensor->view_src; }
+        GGML_ASSERT(tensor->buffer != nullptr && !ggml_backend_buffer_is_host(tensor->buffer));
+    }
+    kv_stream_execute_reference_plan(ctx, dst, kv_stream_read_reference_plan(dst, path));
+}
+
+static void kv_stream_attention_oracle(
+        const ggml_tensor * dst, uint32_t layer, size_t worst_element,
+        const std::vector<float> & streamed, const std::vector<float> & ordinary,
+        const std::vector<float> & resident_fp32) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    float scale, max_bias, logit_softcap;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    auto supported_type = [](ggml_type type) {
+        return type == GGML_TYPE_Q5_1 || type == GGML_TYPE_F16 || type == GGML_TYPE_F32;
+    };
+    if (!std::isfinite(scale) || max_bias != 0.0f || logit_softcap != 0.0f || dst->src[4] != nullptr ||
+            !supported_type(K->type) || !supported_type(V->type) ||
+            Q->ne[2] % K->ne[2] != 0 || Q->nb[0] != sizeof(float) ||
+            (mask != nullptr && (mask->ne[2] != 1 || mask->ne[3] != 1)) ||
+            !ggml_is_contiguous(dst)) {
+        GGML_LOG_WARN("kv_stream_attention_oracle_skip: layer=%u reason=unsupported_parameters_or_layout\n", layer);
+        return;
+    }
+
+    const int64_t dim = Q->ne[0];
+    const int64_t queries = Q->ne[1];
+    const int64_t heads = Q->ne[2];
+    const int64_t tokens = K->ne[1];
+    const int64_t gqa = heads/K->ne[2];
+    std::vector<float> q_values(ggml_nbytes(Q)/sizeof(float));
+    ggml_backend_tensor_get(Q, q_values.data(), 0, ggml_nbytes(Q));
+    std::vector<ggml_fp16_t> mask_values(mask == nullptr ? 0 : ggml_nbytes(mask)/sizeof(ggml_fp16_t));
+    if (mask != nullptr) {
+        ggml_backend_tensor_get(mask, mask_values.data(), 0, ggml_nbytes(mask));
+    }
+    std::vector<std::pair<int64_t, int64_t>> samples;
+    auto add_sample = [&](int64_t query, int64_t head) {
+        const auto sample = std::make_pair(query, head);
+        if (std::find(samples.begin(), samples.end(), sample) == samples.end()) {
+            samples.push_back(sample);
+        }
+    };
+    for (int64_t head : {int64_t(0), gqa - 1, heads/2, heads - 1}) {
+        for (int64_t query : {int64_t(0), queries/2, queries - 1}) {
+            add_sample(query, head);
+        }
+    }
+    add_sample(int64_t(worst_element)/(dim*heads), (int64_t(worst_element)/dim) % heads);
+
+    auto round_f16 = [](float value) {
+        return ggml_fp16_to_fp32(ggml_fp32_to_fp16(value));
+    };
+    auto decode_row = [&](const ggml_tensor * tensor, int64_t token, int64_t head, float * values) {
+        const auto * data = static_cast<const char *>(tensor->data) + token*tensor->nb[1] + head*tensor->nb[2];
+        if (tensor->type == GGML_TYPE_F32) {
+            memcpy(values, data, dim*sizeof(float));
+        } else {
+            ggml_get_type_traits(tensor->type)->to_float(data, values, dim);
+        }
+    };
+    std::vector<float> keys(tokens*dim), values(tokens*dim);
+    std::vector<float> keys_f16(tokens*dim), values_f16(tokens*dim);
+    std::vector<double> q(dim), scores(tokens), answer(dim);
+    int64_t decoded_head = -1;
+    for (const auto & sample : samples) {
+        const int64_t query = sample.first;
+        const int64_t head = sample.second;
+        const int64_t kv_head = head/gqa;
+        if (kv_head != decoded_head) {
+            for (int64_t token = 0; token < tokens; ++token) {
+                decode_row(K, token, kv_head, keys.data() + token*dim);
+                decode_row(V, token, kv_head, values.data() + token*dim);
+            }
+            for (size_t i = 0; i < keys.size(); ++i) {
+                keys_f16[i] = round_f16(keys[i]);
+                values_f16[i] = round_f16(values[i]);
+            }
+            decoded_head = kv_head;
+        }
+        for (int mode = 0; mode < 2; ++mode) {
+            const auto & mode_keys = mode == 0 ? keys_f16 : keys;
+            const auto & mode_values = mode == 0 ? values_f16 : values;
+            const size_t q_offset = (query*Q->nb[1] + head*Q->nb[2])/sizeof(float);
+            for (int64_t d = 0; d < dim; ++d) {
+                const float value = q_values[q_offset + d];
+                // MMA rounds Q before multiplying by the rounded scale.
+                q[d] = mode == 0 ? round_f16(round_f16(value)*round_f16(scale)) : double(value)*scale;
+            }
+            double maximum = -std::numeric_limits<double>::infinity();
+            int64_t visible = 0;
+            bool inputs_finite = true;
+            for (int64_t token = 0; token < tokens; ++token) {
+                const double bias = mask == nullptr ? 0.0 : ggml_fp16_to_fp32(
+                    mask_values[query*(mask->nb[1]/sizeof(ggml_fp16_t)) + token]);
+                if (!std::isfinite(bias)) {
+                    inputs_finite &= bias == -std::numeric_limits<double>::infinity();
+                    scores[token] = -std::numeric_limits<double>::infinity();
+                    continue;
+                }
+                double score = bias;
+                for (int64_t d = 0; d < dim; ++d) {
+                    score += q[d]*mode_keys[token*dim + d];
+                }
+                scores[token] = score;
+                inputs_finite &= std::isfinite(score);
+                maximum = std::max(maximum, score);
+                ++visible;
+            }
+            std::fill(answer.begin(), answer.end(), 0.0);
+            double denominator = 0.0;
+            for (int64_t token = 0; token < tokens; ++token) {
+                if (!std::isfinite(scores[token])) { continue; }
+                const double weight = std::exp(scores[token] - maximum);
+                denominator += weight;
+                for (int64_t d = 0; d < dim; ++d) {
+                    answer[d] += weight*mode_values[token*dim + d];
+                }
+            }
+            double streamed_max = 0.0, ordinary_max = 0.0, resident_max = 0.0;
+            double streamed_squared = 0.0, ordinary_squared = 0.0, resident_squared = 0.0;
+            bool finite = inputs_finite && visible > 0 && std::isfinite(denominator) && denominator > 0.0;
+            const size_t offset = (query*heads + head)*dim;
+            for (int64_t d = 0; d < dim; ++d) {
+                const double expected = answer[d]/denominator;
+                finite &= std::isfinite(expected) && std::isfinite(streamed[offset + d]) &&
+                    std::isfinite(ordinary[offset + d]) && std::isfinite(resident_fp32[offset + d]);
+                const double stream_error = double(streamed[offset + d]) - expected;
+                const double ordinary_error = double(ordinary[offset + d]) - expected;
+                const double resident_error = double(resident_fp32[offset + d]) - expected;
+                streamed_max = std::max(streamed_max, std::abs(stream_error));
+                ordinary_max = std::max(ordinary_max, std::abs(ordinary_error));
+                resident_max = std::max(resident_max, std::abs(resident_error));
+                streamed_squared += stream_error*stream_error;
+                ordinary_squared += ordinary_error*ordinary_error;
+                resident_squared += resident_error*resident_error;
+            }
+            GGML_LOG_WARN("kv_stream_attention_oracle: layer=%u queries=%lld kv=%lld query=%lld head=%lld mode=%s visible=%lld worst_row=%d streamed_max_abs=%.9g streamed_rmse=%.9g ordinary_max_abs=%.9g ordinary_rmse=%.9g resident_fp32_max_abs=%.9g resident_fp32_rmse=%.9g finite=%d\n",
+                layer, (long long) queries, (long long) tokens, (long long) query, (long long) head,
+                mode == 0 ? "f16_inputs" : "quantized_inputs", (long long) visible,
+                int(size_t(offset) == worst_element/size_t(dim)*size_t(dim)),
+                streamed_max, std::sqrt(streamed_squared/dim), ordinary_max, std::sqrt(ordinary_squared/dim),
+                resident_max, std::sqrt(resident_squared/dim), int(finite));
+        }
+    }
+}
+
+static void kv_stream_check_attention(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        ggml_cuda_kv_stream_transfer_ring * ring,
+        ggml_cuda_kv_stream_resident_cache * cache,
+        uint32_t layer, uint32_t resident_pages,
+        const void * last_k, const void * last_v, int64_t last_token, int64_t last_tokens,
+        const kv_stream_reference_plan * plan) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const uint32_t shape = Q->ne[1] == 1 ? 1 : (Q->ne[1] == 2 ? 2 : 4);
+    if (getenv("GGML_CUDA_KV_STREAM_CHECK_ATTENTION") == nullptr ||
+            K->ne[1] > 16384 || (layer != 0 && layer != cache->layer_count/2 && layer + 1 != cache->layer_count)) {
+        return;
+    }
+    if (ring->checked_query_shapes.size() < cache->layer_count) {
+        ring->checked_query_shapes.resize(cache->layer_count, 0);
+    }
+    if ((ring->checked_query_shapes[layer] & shape) != 0) { return; }
+    ring->checked_query_shapes[layer] |= shape;
+
+    // Compare the same Q/K/V against ordinary CUDA attention, once per query shape.
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    size_t k_bad = 0;
+    size_t v_bad = 0;
+    size_t k_bad_visible = 0;
+    size_t v_bad_visible = 0;
+    int64_t k_bad_row = -1;
+    int64_t v_bad_row = -1;
+    size_t last_k_bad = 0;
+    size_t last_v_bad = 0;
+    size_t last_k_bad_visible = 0;
+    size_t last_v_bad_visible = 0;
+    int64_t last_k_bad_row = -1;
+    int64_t last_v_bad_row = -1;
+    {
+        const size_t resident_tokens = size_t(resident_pages)*cache->page_tokens;
+        std::vector<uint8_t> visible(K->ne[1], 1);
+        const ggml_tensor * mask = dst->src[3];
+        if (mask != nullptr) {
+            std::vector<uint16_t> values(ggml_nbytes(mask)/sizeof(uint16_t));
+            ggml_backend_tensor_get(mask, values.data(), 0, ggml_nbytes(mask));
+            std::fill(visible.begin(), visible.end(), 0);
+            for (int64_t query = 0; query < Q->ne[1]; ++query) {
+                for (size_t row = 0; row < visible.size(); ++row) {
+                    visible[row] |= (values[query*(mask->nb[1]/sizeof(uint16_t)) + row] & 0x7c00) != 0x7c00;
+                }
+            }
+        }
+        const size_t k_plane = size_t(resident_pages)*cache->page_tokens*K->nb[1];
+        char * base = cache->pool_data + cache->scratch_bytes + cache->layer_offsets[layer]*cache->page_bytes;
+        auto check_bytes = [&](const void * gpu, const void * host, size_t bytes,
+                size_t row_bytes, size_t first_token, size_t & visible_bad, int64_t & first_row) {
+            std::vector<uint8_t> actual(bytes);
+            CUDA_CHECK(cudaMemcpy(actual.data(), gpu, bytes, cudaMemcpyDeviceToHost));
+            const auto * expected = static_cast<const uint8_t *>(host);
+            size_t bad = 0;
+            for (size_t i = 0; i < bytes; ++i) {
+                if (actual[i] == expected[i]) { continue; }
+                ++bad;
+                if (visible[first_token + i/row_bytes]) {
+                    ++visible_bad;
+                    if (first_row < 0) { first_row = int64_t(first_token + i/row_bytes); }
+                }
+            }
+            return bad;
+        };
+        k_bad = check_bytes(base, K->data, k_plane, K->nb[1], 0, k_bad_visible, k_bad_row);
+        v_bad = check_bytes(base + k_plane, V->data, resident_tokens*V->nb[1], V->nb[1], 0, v_bad_visible, v_bad_row);
+        if (last_k != nullptr) {
+            last_k_bad = check_bytes(last_k, static_cast<const char *>(K->data) + last_token*K->nb[1],
+                last_tokens*K->nb[1], K->nb[1], last_token, last_k_bad_visible, last_k_bad_row);
+            last_v_bad = check_bytes(last_v, static_cast<const char *>(V->data) + last_token*V->nb[1],
+                last_tokens*V->nb[1], V->nb[1], last_token, last_v_bad_visible, last_v_bad_row);
+        }
+    }
+
+    ggml_cuda_pool_alloc<char> k_copy(ctx.pool(), ggml_nbytes(K));
+    ggml_cuda_pool_alloc<char> v_copy(ctx.pool(), ggml_nbytes(V));
+    CUDA_CHECK(cudaMemcpyAsync(k_copy.get(), K->data, ggml_nbytes(K), cudaMemcpyHostToDevice, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(v_copy.get(), V->data, ggml_nbytes(V), cudaMemcpyHostToDevice, ctx.stream()));
+    ggml_tensor reference_k = *K;
+    ggml_tensor reference_v = *V;
+    reference_k.data = k_copy.get();
+    reference_v.data = v_copy.get();
+    ggml_tensor reference = *dst;
+    reference.src[1] = &reference_k;
+    reference.src[2] = &reference_v;
+    reference.data = nullptr;
+    ggml_cuda_pool_alloc<char> output(ctx.pool(), ggml_cuda_flash_attn_ext_get_alloc_size(ctx.device, &reference));
+    reference.data = output.get();
+    ggml_cuda_flash_attn_ext(ctx, &reference);
+
+    std::vector<float> expected(ggml_nelements(dst));
+    std::vector<float> actual(expected.size());
+    CUDA_CHECK(cudaMemcpyAsync(expected.data(), reference.data, expected.size()*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(actual.data(), dst->data, actual.size()*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    double max_abs = 0.0;
+    double squared = 0.0;
+    double reference_squared = 0.0;
+    bool finite = true;
+    size_t worst_element = 0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        finite &= std::isfinite(expected[i]) && std::isfinite(actual[i]);
+        const double error = double(actual[i]) - expected[i];
+        if (std::abs(error) > max_abs) { worst_element = i; }
+        max_abs = std::max(max_abs, std::abs(error));
+        squared += error*error;
+        reference_squared += double(expected[i])*expected[i];
+    }
+    GGML_LOG_WARN("kv_stream_attention_check: layer=%u layers=%u queries=%lld kv=%lld resident=%u kernel=%d k_bad=%zu v_bad=%zu k_bad_visible=%zu v_bad_visible=%zu k_bad_row=%lld v_bad_row=%lld stream_checked=%d stream_token=%lld stream_tokens=%lld stream_k_bad=%zu stream_v_bad=%zu stream_k_bad_visible=%zu stream_v_bad_visible=%zu stream_k_bad_row=%lld stream_v_bad_row=%lld max_abs=%.9g rmse=%.9g relative_l2=%.9g finite=%d\n",
+        layer, cache->layer_count, (long long) Q->ne[1], (long long) K->ne[1], resident_pages*cache->page_tokens,
+        int(ggml_cuda_get_best_fattn_kernel(ctx.device, dst)), k_bad, v_bad, k_bad_visible, v_bad_visible,
+        (long long) k_bad_row, (long long) v_bad_row, int(last_k != nullptr),
+        (long long) last_token, (long long) last_tokens, last_k_bad, last_v_bad,
+        last_k_bad_visible, last_v_bad_visible, (long long) last_k_bad_row, (long long) last_v_bad_row, max_abs,
+        std::sqrt(squared/actual.size()), std::sqrt(squared/std::max(reference_squared, 1e-30)), int(finite));
+    if (plan != nullptr && !plan->spans.empty()) {
+        kv_stream_execute_reference_plan(ctx, &reference, *plan);
+        std::vector<float> partition(actual.size());
+        CUDA_CHECK(cudaMemcpyAsync(partition.data(), reference.data, partition.size()*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        double partition_max_abs = 0.0;
+        double partition_squared = 0.0;
+        bool partition_finite = true;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            partition_finite &= std::isfinite(partition[i]) && std::isfinite(actual[i]);
+            const double error = double(actual[i]) - partition[i];
+            partition_max_abs = std::max(partition_max_abs, std::abs(error));
+            partition_squared += error*error;
+        }
+        GGML_LOG_WARN("kv_stream_partition_check: layer=%u queries=%lld kv=%lld spans=%zu max_abs=%.9g rmse=%.9g finite=%d\n",
+            layer, (long long) Q->ne[1], (long long) K->ne[1], plan->spans.size(), partition_max_abs,
+            std::sqrt(partition_squared/actual.size()), int(partition_finite));
+    }
+    if (kv_stream_fp32_mma_supported(ctx.device, dst)) {
+        std::vector<float> resident_fp32(actual.size());
+        kv_stream_fp32_mma_resident(ctx, &reference);
+        CUDA_CHECK(cudaMemcpyAsync(resident_fp32.data(), reference.data,
+            resident_fp32.size()*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        double pair_max_abs = 0.0;
+        double pair_squared = 0.0;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            const double error = double(actual[i]) - resident_fp32[i];
+            pair_max_abs = std::max(pair_max_abs, std::abs(error));
+            pair_squared += error*error;
+        }
+        GGML_LOG_WARN("kv_stream_fp32_pair: layer=%u queries=%lld kv=%lld max_abs=%.9g rmse=%.9g\n",
+            layer, (long long) Q->ne[1], (long long) K->ne[1], pair_max_abs, std::sqrt(pair_squared/actual.size()));
+        kv_stream_attention_oracle(dst, layer, worst_element, actual, expected, resident_fp32);
+    }
+}
+
 void ggml_cuda_flash_attn_ext_streamed(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
@@ -1934,7 +2475,8 @@ void ggml_cuda_flash_attn_ext_streamed(
 
     const bool use_mma_prefill = !convert_to_f16 &&
         Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
-        mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
+        mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8 &&
+        ggml_cuda_get_best_fattn_kernel(ctx.device, dst) == BEST_FATTN_KERNEL_MMA_F16;
     const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
     GGML_ASSERT(partial_count > 0 && partial_count <= KV_STREAM_MAX_PARTS_PER_CHUNK);
     GGML_ASSERT(Q->ne[1] > 0 && nrows % Q->ne[1] == 0);
@@ -1943,6 +2485,12 @@ void ggml_cuda_flash_attn_ext_streamed(
         std::min<int64_t>(Q->ne[1], KV_STREAM_QUERY_WORKSPACE_TOKENS);
     const size_t workspace_rows = size_t(workspace_queries*rows_per_query);
     const size_t workspace_elements = workspace_rows*dst->ne[0];
+    const bool record_plan = getenv("GGML_CUDA_KV_STREAM_RECORD_PLAN") != nullptr;
+    const bool capture_plan = !convert_to_f16 && (record_plan || getenv("GGML_CUDA_KV_STREAM_CHECK_ATTENTION") != nullptr);
+    kv_stream_reference_plan reference_plan;
+    reference_plan.mode = use_mma_prefill ? KV_STREAM_REFERENCE_MMA_PARTS : KV_STREAM_REFERENCE_VEC_PARTS;
+    reference_plan.parts = partial_count;
+    reference_plan.queries = workspace_queries;
 
     ggml_cuda_pool & pool = ctx.pool();
     ggml_cuda_pool_alloc<float> parts(pool);
@@ -2220,10 +2768,22 @@ void ggml_cuda_flash_attn_ext_streamed(
         staged_dst.src[2] = convert_to_f16 ? &converted_v : &staged_v;
         staged_dst.src[3] = staged_mask_ptr;
 
-        // Preserve normal CUDA flash attention when the active cache is fully resident or fits in one streamed page.
-        // This avoids a partial reduction and keeps logits identical to a non-streamed cache.
+        // Keep MMA numerator precision the same before and after the first spill.
         if (!convert_to_f16 && (streamed_chunks.empty() || nchunks == 1)) {
-            ggml_cuda_flash_attn_ext(ctx, &staged_dst);
+            const bool fp32 = use_mma_prefill && kv_stream_fp32_mma_supported(ctx.device, &staged_dst);
+            if (fp32) {
+                kv_stream_fp32_mma_resident(ctx, &staged_dst);
+                if (resident_cache != nullptr) {
+                    ++resident_cache->stats.mma_prefill_attention_spans;
+                }
+            } else {
+                ggml_cuda_flash_attn_ext(ctx, &staged_dst);
+            }
+            if (record_plan) {
+                reference_plan.mode = fp32 ? KV_STREAM_REFERENCE_FP32 : KV_STREAM_REFERENCE_STOCK;
+                reference_plan.spans.emplace_back(desc.token_begin, desc.token_count);
+                kv_stream_record_reference_plan(dst, reference_plan);
+            }
             if (desc.streamed) {
                 if (graph_planned) {
                     kv_stream_graph_release(transfer_ring, desc.request_index, ctx.stream());
@@ -2236,6 +2796,7 @@ void ggml_cuda_flash_attn_ext_streamed(
         }
 
         GGML_ASSERT(needs_partial_reduction);
+        if (capture_plan) { reference_plan.spans.emplace_back(desc.token_begin, desc.token_count); }
 
         // Keep each staged KV span alive while all bounded query tiles consume it.
         // This bounds vector scratch without issuing another H2D transfer for the span.
@@ -2257,7 +2818,7 @@ void ggml_cuda_flash_attn_ext_streamed(
             }
 
             ggml_tensor query_dst = staged_dst;
-            query_dst.ne[1] = query_count;
+            query_dst.ne[2] = query_count;
             query_dst.src[0] = &query_q;
             query_dst.src[3] = query_mask_ptr;
 
@@ -2323,6 +2884,15 @@ void ggml_cuda_flash_attn_ext_streamed(
     ggml_cuda_kernel_launch(kv_stream_normalize_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
         accumulator.ptr, accumulator_meta.ptr, static_cast<float *>(dst->data), nrows);
     CUDA_CHECK(cudaGetLastError());
+    if (record_plan) { kv_stream_record_reference_plan(dst, reference_plan); }
+    if (!streamed_chunks.empty() && resident_cache != nullptr) {
+        // Cross-layer prefetch can reuse released ring slots; inspect them only without it.
+        const auto & last = chunks[streamed_chunks.back()];
+        kv_stream_check_attention(ctx, dst, transfer_ring, resident_cache, resident_layer, resident_layer_pages,
+            graph_planned ? nullptr : last.k_stage, graph_planned ? nullptr : last.v_stage,
+            graph_planned ? 0 : last.token_begin, graph_planned ? 0 : block_tokens,
+            capture_plan ? &reference_plan : nullptr);
+    }
 }
 
 template <int DKQ, int DV, int ncols2>
@@ -2656,14 +3226,6 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     GGML_ABORT("fatal error");
 }
 
-// Best FlashAttention kernel for a specific GPU:
-enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE    =   0,
-    BEST_FATTN_KERNEL_TILE    = 200,
-    BEST_FATTN_KERNEL_VEC     = 100,
-    BEST_FATTN_KERNEL_MMA_F16 = 400,
-};
-
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -2898,6 +3460,20 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (const char * path = getenv("GGML_CUDA_KV_STREAM_REPLAY_PLAN")) {
+        kv_stream_replay_reference_plan(ctx, dst, path);
+        return;
+    }
+    if (getenv("GGML_CUDA_KV_STREAM_FP32_REFERENCE") != nullptr && kv_stream_fp32_mma_supported(ctx.device, dst)) {
+        GGML_LOG_INFO("kv_stream_fp32_reference: queries=%lld kv=%lld\n",
+            (long long) dst->src[0]->ne[1], (long long) dst->src[1]->ne[1]);
+        kv_stream_fp32_mma_resident(ctx, dst);
+        return;
+    }
+    ggml_cuda_flash_attn_ext_standard(ctx, dst);
+}
+
+static void ggml_cuda_flash_attn_ext_standard(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

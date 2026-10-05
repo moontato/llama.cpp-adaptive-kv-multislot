@@ -1415,8 +1415,8 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
     owner.previous_deadline_samples = deadline_samples;
     owner.previous_deadline_misses = deadline_misses;
     if (getenv("LLAMA_KV_STREAM_TRACE") != nullptr) {
-        LLAMA_LOG_WARN("%s: active %u, resident %u, ring %u, samples %llu, misses %llu, copy busy %.1f%%, peak %u\n",
-            __func__, active_tokens, resident_pages, ring_slots,
+        LLAMA_LOG_WARN("%s: queries %u, active %u, resident %u, ring %u, samples %llu, misses %llu, copy busy %.1f%%, peak %u\n",
+            __func__, query_tokens, active_tokens, resident_pages, ring_slots,
             (unsigned long long) delta.deadline_samples,
             (unsigned long long) delta.deadline_misses,
             100.0*copy_busy_ratio, peak_occupancy);

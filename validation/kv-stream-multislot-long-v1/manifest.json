@@ -1,0 +1,66 @@
+{
+  "revision": "long-server-v1",
+  "base_commit": "d7680c67b89f7cd4e3069b4bc2f26747aa588e3d",
+  "patch_revision": 8,
+  "patch_sha256": "9b36afe5b0083dbcb87751ebd75ba2c39a877063758f17a1ca2ed3746f0ecfe3",
+  "v8_patched_file_sha256": {
+    "README.md": "5f78ce84b9e053470040de9abe7e0dbd009aad01b2968d06311cdb99e0036631",
+    "docs/kv-stream-multislot-testing.md": "258d4928ab2a1f0b2903fd8c81a0d41f0cf1e3cdd2f01b41d0921ba8157264ca",
+    "ggml/src/ggml-cuda/fattn-mma-f16.cuh": "671b1c4a110be0605c86e570f0d25c2f175f5282e44dc51a7ad3c53a78e05e70",
+    "ggml/src/ggml-cuda/fattn.cu": "783c5f6ff2b3c14bd46d961d8a06a5d01c74d1770e1338d17bc9e40242fd358a",
+    "scripts/run_kv_multislot_tests.py": "53199beff641486241e16003384fafd69269bade9b71e55ee5654a812672ae4e",
+    "src/llama-context.cpp": "7ebac00defb2a812d4e86332e17109da3fd26438bcce350b88189e51b10cdf2b",
+    "src/llama-kv-cache.cpp": "f53f8e0346c9655f4d1255b857584346e67eb8c0e22bdcfe7453e43ef5a073a1",
+    "src/llama-kv-stream-config.cpp": "e568a9619b5057f8c7ec37ec9e0d6407804ae57ed6e72a16814a0c347951e8a5",
+    "src/llama-kv-stream-config.h": "584bc6d9004e693fe69526eaa6a8f52c8579f19a1481059c5a208349e8607da7",
+    "tests/CMakeLists.txt": "f45b4795757267b508c61ce49f8778c37ae391cff5524ce463ddb08753ad1b8f",
+    "tests/test-kv-stream-config.cpp": "bbfabb47611357f6c20a7f8599be693bb66d81725b2d8f3822f9bc3a516a2d81",
+    "tests/test-kv-stream-cuda-attn.cpp": "e102402a9908e4a3db2c6111f93c58cb5809597fa9f953c2b5d0943e4fdd7c60",
+    "tests/test-kv-stream-multislot.cpp": "5acec1b742cb2ec4090d94e8327d6c478104cff71bfa7c85f30ec4b4b424ae97",
+    "tools/server/server-context.cpp": "9105c28f83965d150024c6c1b33bd0fa131191ca52d542f91aa77efcee3e7ac5"
+  },
+  "returned_v8_results": {
+    "archive": "results-20261005-080127-147262.tar.gz",
+    "status": "PASS_SHORT_ONLY",
+    "failed_checks": [],
+    "ctest_targets_passed": 7,
+    "model_comparisons": {
+      "model-short.csv": {
+        "required_comparisons": 64,
+        "bit_exact": 64,
+        "failures": 0
+      },
+      "model-pressure.csv": {
+        "required_comparisons": 64,
+        "bit_exact": 64,
+        "failures": 0
+      },
+      "model-attention-diagnostic.csv": {
+        "required_comparisons": 64,
+        "bit_exact": 64,
+        "failures": 0
+      }
+    },
+    "full_attention_output_checks": 10,
+    "full_attention_checks_bit_exact": 10,
+    "pressure_replayed_attention_calls": 2560,
+    "all_pressure_plans_complete": true
+  },
+  "default_tokens_per_slot": [
+    125000,
+    124743
+  ],
+  "optional_tokens_per_slot": [
+    250000,
+    249743
+  ],
+  "entrypoint": "run_kv_multislot_long_tests.py",
+  "numerical_equivalence_test": false,
+  "validation": "Source review only for the new script. No compilation or executable validation in the authoring environment. Run all testing under /mnt/ramdisk. Existing V8 source and binary are not modified or rebuilt.",
+  "bundle_file_sha256": {
+    "README.md": "59b55fd3c1dccf40955b0e5595a370f2692f8653c3b807cb1d6841509b6abd90",
+    "run_kv_multislot_long_tests.py": "5ab19bc8288188ea6bfed88d43930580ffa8322bd9a6b6740687f1b90371c80d",
+    "run_kv_multislot_tests.py": "53199beff641486241e16003384fafd69269bade9b71e55ee5654a812672ae4e",
+    "kv-stream-multislot.patch": "9b36afe5b0083dbcb87751ebd75ba2c39a877063758f17a1ca2ed3746f0ecfe3"
+  }
+}

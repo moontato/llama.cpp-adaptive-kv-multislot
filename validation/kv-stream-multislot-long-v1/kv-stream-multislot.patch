@@ -1,0 +1,2637 @@
+diff --git a/README.md b/README.md
+index 71ba4a3..aab8df6 100644
+--- a/README.md
++++ b/README.md
+@@ -61,6 +61,18 @@ The arena value is the fixed total shared allocation, not just KV capacity. Its
+ 
+ llama.cpp's device-memory auto-fit dry run is bypassed when a nonzero arena is configured. The arena and supported single-GPU layer placement are already explicit, while the upstream no-allocation estimator cannot represent overlapping phase lifetimes. Real context initialization still measures both phase graphs and rejects an arena that cannot fit either layout.
+ 
++### Parallel slots with unified KV (experimental)
++
++With a nonzero phase arena, `--parallel 2 --kv-unified` shares one physical KV stream and adaptive CUDA pool across the two sequence histories. Sequence masks isolate attention; dirty-row tracking refreshes pages when either slot writes or reuses cache cells. The pool is shared by occupied cache rows, without fixed per-slot VRAM partitions. `--kv-unified` refers to llama.cpp's logical KV allocation, not CUDA Unified Memory.
++
++Generation batches may contain one token from each active slot, including a single active slot after the other finishes. Each phase reserves compute workspace across all active sequence counts. Mixed prompt/generation batches retain the conservative prompt workspace. Parallel streaming rejects speculative decoding, including MTP and ngram modes.
++
++For two slots that each admit a 250K prompt, configure aggregate capacity and a per-slot limit, for example `--ctx-size 524288 --parallel 2 --kv-unified --kv-unified-per-slot 262144 -ctk q5_1 -ctv q5_1`. Retain Flash Attention, GPU KV offload, and your known working arena size. The additional host KV capacity still consumes system RAM. Multi-query decode uses the existing streamed attention path; TG1 cross-layer lookahead does not imply equal throughput with two active slots.
++
++Eligible NVIDIA prefill attention with 256-dimensional heads uses FP32 value accumulation both before and after the first KV spill. The model tests compare cache behavior against a GPU-resident FP32 baseline and check selected attention rows against independent double-precision math. Ordinary CUDA precision differences remain visible in the reports.
++
++This patch targets `feature/kv-stream-phase-arena`, not the V2 fork. GPU validation of the current revision and long-context behavior is pending. See [the ramdisk test instructions](docs/kv-stream-multislot-testing.md) for the pinned build, CUDA tests, teacher-forced logit comparisons, server concurrency and state restore tests, and the optional long diagnostic. Two slots are the model-tested target; larger counts require further validation.
++
+ ### Batch and micro-batch sizes
+ 
+ `-b` sets the logical prompt batch size and `-ub` sets the largest physical batch submitted to one graph. This branch no longer requires `256/256`; `-ub` may be any positive value no larger than `-b`.
+diff --git a/docs/kv-stream-multislot-testing.md b/docs/kv-stream-multislot-testing.md
+new file mode 100644
+index 0000000..9416a2b
+--- /dev/null
++++ b/docs/kv-stream-multislot-testing.md
+@@ -0,0 +1,117 @@
++# Unified multi-slot adaptive KV: test instructions
++
++This experimental patch is for `RaymondHuang210129/llama.cpp-adaptive-kv-streaming`, branch `feature/kv-stream-phase-arena`, base commit `d7680c67b89f7cd4e3069b4bc2f26747aa588e3d`. It does not apply to `feature/adaptive-kv-stream-v2`. All executable validation belongs on the target machine under `/mnt/ramdisk`. The authoring environment has neither that mount nor CUDA, so revision 8 has been source reviewed but has not been compiled or executed there.
++
++Revision 7 built in 32.7 seconds after restoring nine unchanged files' timestamps. All 64 required short-model comparisons were bit-identical. Pressure still failed 38 of 64 comparisons against the single-span FP32 reference, with maximum logit error 10.3782, although all 64 greedy token IDs agreed. Server checks and the CPU oracle validation passed. CTest failed only two assertions that still compared the revised FP32 resident path bit-for-bit against stock FP16 attention. Revision 8 corrects those assertions to use resident FP32 attention and keeps exact equality.
++
++The pressure diagnostics found exact resident-prefix and safely inspected streamed-page K/V bytes in all checked layers. On selected actual-input prefill rows, streamed attention and the resident FP32 reference were similarly close to the double-precision CPU oracle, while stock FP16 attention was substantially further away. One- and two-query attention differences against ordinary CUDA were around 1e-6. These observations do not establish that every cache operation is correct. They suggest that changing the attention span partition could introduce small rounding differences that amplify through this quantized hybrid model. That explanation is still a hypothesis.
++
++Revision 8 tests that hypothesis with a new GPU-resident reference. Each streamed context records only its attention arithmetic schedule: operation shapes/types/parameters, MMA or vector selection, query tile size, partial count, and ordered KV token spans. A separate context, with the arena disabled, maintains its own entirely GPU-resident KV and recurrent state, processes the same teacher-forced token histories and slot schedule, and replays those boundaries. It reads no recorded K/V values, queries, activations or logits. It bypasses the host KV cache, transfer ring, residency tracking, prefetch and dirty-row updates. The reference shares the CUDA partial-attention arithmetic and merge with streaming, so it tests storage and cache scheduling rather than independently proving that arithmetic.
++
++All 64 whole-model cache comparisons remain required, with the unchanged max logit error <= 0.15 and RMSE <= 0.02. They now use `partition_resident_*` CSV names. Revision 7's single-span FP32 reference remains as 39 `fp32_resident_vs_streamed_*` diagnostics, alongside 39 stock CUDA diagnostics; those have `required=0`. They cannot be used to claim a pressure-model pass against single-span arithmetic. If the partition reference fails, the run still fails. If it passes while single-span results disagree, the evidence supports an arithmetic-partition explanation for that disagreement.
++
++The runner requires four complete plans, checks recorded/replayed call counts and order, and rejects missing operations or inconsistent geometry. Backend replay validates a shape/type/parameter hash and contiguous, nonoverlapping spans covering the entire KV extent. Pressure must include split MMA prefill and split vector attention in the two-slot context. CUDA graphs are disabled in the model integration executable so every operation is recorded and replayed; these model results do not validate graph replay or serving performance. Normal server and CUDA unit checks remain separate. Record/replay flags are internal test controls, unset for normal serving, and the runner removes inherited test flags.
++
++The attention diagnostic also compares the entire output tensor, for each checked operation, with an independently uploaded GPU-resident cache under the same span partition. This keeps Q, K, V and the mask identical at the comparison boundary and catches cache errors without downstream amplification. Its max absolute error and RMSE must both be <= 0.0005, the existing CUDA-attention tolerance. Exact resident-prefix and safe streamed-page byte checks must pass. `kv_stream_fp32_pair` additionally records the full-tensor difference against the single-span FP32 reference, to measure partition sensitivity directly.
++
++Independent mathematics checks are retained. The CPU oracle uses double-precision dot products, global softmax and weighted value sums for representative actual-input rows. The model has 64 hybrid blocks but only 16 KV-attention layers; the checked first, middle and last cache-layer indices are 0, 8 and 15. The oracle samples first/middle/last queries across representative GQA heads plus the largest stock-versus-streamed difference, at most 13 query/head pairs per operation. `f16_inputs` rounds K/V and query inputs as MMA does, including rounding Q before multiplication by the rounded scale. `quantized_inputs` uses CPU-dequantized F32 K/V and original F32 queries. Neither mode emulates CUDA probability rounding or accumulation order. Streamed, stock and single-span resident FP32 outputs are compared with the oracle.
++
++The existing constant-value Q5_1 tests cover 3K and 32K spans with forced spill and an independent analytic answer. The runner always validates the CPU oracle on the 3K known-answer case and requires streamed and single-span FP32 errors <= 0.0005 there and on sampled first-cache-layer FP16-input model rows. Middle/final-layer oracle errors are recorded and must be finite; no new uncalibrated threshold is imposed on their absolute scale. The oracle supports Q5_1, F16/F32 KV, one sequence dimension and attention without sinks, ALiBi or softcap. Diagnostics are bounded to KV extents <= 16,384 and run once per query-count category in each selected layer/runtime. Sampled oracle checks are not an exhaustive numerical proof.
++
++Keep the 128 MiB pressure arena and `--skip-long`. The next result must come from the target machine. This revision changes the validation reference and diagnostics; it makes no further change to production attention precision beyond revision 7. A passing short/pressure report still cannot establish 250K-per-slot support.
++
++## Run the current validation
++
++Unpack the supplied bundle. It contains this guide, `kv-stream-multislot.patch`, and a standalone Python runner. Install Git, Python 3.9+, CMake 3.21+, a compatible C++ compiler, CUDA toolkit, and the NVIDIA driver. `cmake`, `ctest`, `git`, `nvcc`, and `nvidia-smi` must be on PATH. The runner downloads the pinned source from GitHub, applies the patch, builds the server and selected tests, and runs them. No Python packages are required.
++
++Use your existing mounted 24 GiB ramdisk at `/mnt/ramdisk`. If you need to create it first on Linux:
++
++```bash
++sudo mkdir -p /mnt/ramdisk
++sudo mount -t tmpfs -o size=24G,mode=1777 tmpfs /mnt/ramdisk
++```
++
++From the unpacked bundle, run:
++
++```bash
++python3 run_kv_multislot_tests.py \
++  --model /absolute/path/to/your-model.gguf \
++  --arena-mib 4096 \
++  --pressure-arena-mib 128 \
++  --skip-long
++```
++
++Set `--arena-mib` to the size that works for your current single-slot setup. Defaults are Q5_1 K/V, RTX 4080 CUDA architecture 89, 512-token logical batches, 128-token micro-batches, and two build jobs. The optional long diagnostic uses two 250,000-token histories and independent reference histories, and can take hours. `--model-timeout-hours 24` is the timeout per model test, not an estimated runtime.
++
++Keep `--skip-long` for this investigation. Its successful report says `PASS_SHORT_ONLY`, so it cannot establish 250K-per-slot support. The runner performs the short model checks with your arena, plus approximately 3K tokens per slot with a 128 MiB arena. The smaller arena is a pressure test, not a recommended serving setting. `--pressure-arena-mib` can override that size if the compute workspace requires more room; the runner requires a trace showing two-query generation beyond the uniform resident capacity. `--ubatch 256` can test your usual micro-batch size; rerun with a fresh invocation for each value. `--gpu-layers` and `--cuda-arch` can be overridden. GPU tests use CUDA device 0; use `CUDA_VISIBLE_DEVICES` if necessary. Do not run other GPU-heavy work at the same time.
++
++## Resume the existing build
++
++Extract the revision 8 bundle into `/mnt/ramdisk`. From its directory, run the new runner against the existing workspace:
++
++```bash
++python3 run_kv_multislot_tests.py \
++  --resume /mnt/ramdisk/kv-multislot-20261004-090100-122194 \
++  --model /absolute/path/to/your-model.gguf \
++  --arena-mib 4096 \
++  --pressure-arena-mib 128 \
++  --skip-long
++```
++
++The runner checks the base commit, safely replaces its previously applied patch with the included revision, and resumes the existing CMake build. It retains unchanged compiled objects and restores timestamps only when patched file content and mode remain identical. `resume-timestamps.json` records the decision. Revision 8 changes the main CUDA attention source, the CUDA attention unit source and the model integration source. Attention template headers are unchanged from revision 7, avoiding the broad template rebuild. Keep the original CUDA architecture and build settings. If the workspace was removed, omit `--resume` for a fresh build.
++
++The long diagnostic remains available without `--skip-long`, and is skipped after any prerequisite runtime failure unless `--long-on-failure` is supplied. Its existing serial-versus-parallel reference also includes ordinary batching differences, which the returned short tests demonstrated can be substantial; it needs a revised reference before its numerical result can establish long-context streaming correctness. Do not spend another long run on this revision while the pressure failure is unresolved. While a command is running, the terminal prints `WAIT <stage>` about once a minute, including the latest prompt progress where available. Model logs report processed tokens, elapsed time and average tokens/second about every 30 seconds between decode calls. A single decode call can take longer than this interval; the terminal heartbeat continues and does not by itself prove forward progress.
++
++Each resumed run writes a separate `results-<timestamp>-<PID>` directory and matching archive inside that workspace. The original logs and archive remain available. Source edits that prevent safe patch replacement cause the runner to stop and report the conflict.
++
++## Send results
++
++At completion the runner prints one path like:
++
++```text
++/mnt/ramdisk/kv-multislot-YYYYMMDD-HHMMSS-PID/results.tar.gz
++```
++
++For a resumed run, the filename is `results-<timestamp>-<PID>.tar.gz`. Attach the archive printed by the latest run to the conversation. It contains the exact patch, settings, source commit, command logs and exit codes, CTest XML, model comparison CSVs, HTTP responses, slot overlap observations, server metrics, periodic GPU/host memory samples, and `summary.json`. The diagnostic always runs and also includes `model_attention_diagnostic.log`, `model-attention-diagnostic.csv`, `model-attention-diagnostic-proof.json`, `model-attention-diagnostic-attention-checks.json`, and `model-attention-diagnostic-attention-oracles.json`. The known-answer reference check is captured in `attention_oracle_validation.log` and `attention-oracle-validation.json`. The four `model-*.csv.*.plan` files per model run contain arithmetic schedules. `model-*-reference-proof.json` records complete replay coverage, split MMA/vector use and required comparison coverage. The diagnostic also includes `model-attention-diagnostic-partition-checks.json` and `model-attention-diagnostic-fp32-pairs.json`; `resume-timestamps.json` records the timestamp repair when a previous patch was replaced. It contains no model weights. If prerequisites, compilation, or any test fail, the same archive captures the failure. Independent runtime checks continue after a check fails; fatal build or resource errors stop dependent work.
++
++## What is tested
++
++| Check | Evidence |
++| --- | --- |
++| Configuration and phase planning | All seven existing KV-stream CTest targets, plus partial-slot generation and unified-cache validation cases |
++| Q5_1 sequence isolation | Two queries with disjoint interleaved histories, unequal lengths, holes, changing dirty rows, and a forced streaming ring; compared to resident CUDA attention |
++| Long-span prefill precision | Q5_1 with a 2,816- or 32,512-token resident prefix, forced spill, and constant values; compared to the independent analytic answer |
++| Short model correctness | Streamed serial and two-slot logits against independent GPU-resident caches replaying identical attention spans; single-span FP32, stock and serial/parallel differences recorded separately |
++| Model streaming pressure | Approximately 3K tokens per slot with a 128 MiB arena, complete GPU-resident plan replay, split MMA/vector calls and two-query generation beyond resident capacity |
++| Attention diagnostic on every run | Full-tensor same-partition resident attention, single-span FP32 differences, double-precision samples in cache layers 0/8/15, and exact resident-prefix/safe last-page byte checks |
++| Reference validation on every run | Existing constant-value Q5_1 test with the oracle enabled; streamed and GPU-resident FP32 errors checked against its unchanged analytic threshold |
++| Slot scheduling | Both active, only slot 1 active, a mixed prompt/generation batch, slot 0 replacement, and return to both active |
++| State restore | Short per-sequence snapshot after generation, removal and restore, resumed logits and other-slot preservation; HTTP save/erase/restore |
++| Server concurrency | Serial requests, concurrent unequal requests, observed overlap, and a replacement request while the longer slot remains active |
++| Invalid combinations | Non-unified parallel KV and parallel speculative decoding must fail with the intended error |
++| Optional long diagnostic | Two distinct 250,000-token histories in one shared context, compared against independent streamed histories; batching differences confound numerical attribution |
++
++The long test avoids a resident GPU reference and large state snapshots; short tests cover those paths. Prompts are synthetic repeated text, so this suite validates cache mechanics and numerical consistency, not long-context answer quality. CUDA attention comparisons require maximum absolute error <= 0.0005. Whole-model comparisons use max absolute logit error <= 0.15 and RMSE <= 0.02; these initial tolerances have not been calibrated on this GPU/model. Both metrics and greedy token IDs are recorded. In short-run CSVs, `required=1` marks same-partition GPU-resident versus streamed comparisons that affect the exit status. `required=0` marks single-span FP32 and stock-precision comparisons and serial-versus-parallel diagnostics; each includes an arithmetic or batching difference beyond cache storage. The long run retains serial-versus-parallel comparisons as required checks because a resident GPU reference is too large. HTTP token equality is diagnostic because close logits can change greedy choices and then subsequent histories. All logit comparisons use identical token histories.
++
++## Resource behavior
++
++All execution, build output, temporary files, compilation caches, slot snapshots, reports, and result archives live in a runner workspace under `/mnt/ramdisk`. The runner requires a mount at that exact path and never falls back to disk. The existing model is linked into the workspace; all GGUF shards are linked when applicable. The original files are read as input and are not copied or modified.
++
++A periodic guard stops owned processes at 23 GiB of workspace data or below 1 GiB free space, preserving room for reports within the 24 GiB budget. This is a sampled guard, not a filesystem quota: the 24 GiB tmpfs mount supplies the hard limit. Build jobs default to two to reduce peaks. Source and binaries remain in the ramdisk after the run, for inspection and manual use. Only the results directory is archived. Move the archive somewhere durable before unmounting or rebooting.
++
++The ramdisk consumes system RAM in addition to the model and pinned host KV cache. Two 250K histories require substantially more host KV capacity than one. The monitor records host available memory and GPU memory, but does not impose a host-memory quota. A low-memory failure is reported, not treated as a passing test.
++
++## Use the patched server after validation
++
++The build is at the printed workspace's `build/bin/llama-server`. For example:
++
++```bash
++/mnt/ramdisk/kv-multislot-YYYYMMDD-HHMMSS-PID/build/bin/llama-server \
++  --model /absolute/path/to/your-model.gguf \
++  --parallel 2 --kv-unified \
++  --ctx-size 524288 --kv-unified-per-slot 262144 \
++  -fa on -ctk q5_1 -ctv q5_1 -ngl all -b 512 -ub 128 \
++  --kv-stream-arena-mib 2048
++```
++
++The arena is shared dynamically by occupied cache rows, without a fixed half per slot. Aggregate context capacity is separate from the per-slot limit. Unified KV is a logical shared cache, not CUDA managed memory. Parallel speculative decoding is rejected. The multi-query attention path already exists, but its throughput and latency may differ from TG1's cross-layer lookahead path. Model validation targets two slots; larger counts are experimental.
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 63843b9..49e929a 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -903,7 +903,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+         }
+ 
+ #if defined(TURING_MMA_AVAILABLE)
+-        if constexpr (cols_per_warp == 8) {
++        if constexpr (std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]>) {
++#pragma unroll
++            for (int i = 0; i < DV/T_C_VKQ::J; ++i) {
++#pragma unroll
++                for (int l = 0; l < T_C_VKQ::ne; ++l) {
++                    VKQ_C[i].x[l] *= KQ_max_scale[(l/2) % cols_per_thread];
++                }
++            }
++        } else if constexpr (cols_per_warp == 8) {
+             const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[cols_per_thread - 1]);
+ #pragma unroll
+             for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
+@@ -1190,7 +1198,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+     using     T_C_KQ    = typename mma_tile_sizes<DV, ncols>::T_C_KQ;
+     using     T_A_VKQ   = typename mma_tile_sizes<DV, ncols>::T_A_VKQ;
+     using     T_B_VKQ   = typename mma_tile_sizes<DV, ncols>::T_B_VKQ;
+-    using     T_C_VKQ   = typename mma_tile_sizes<DV, ncols>::T_C_VKQ;
++    using     T_C_VKQ_base = typename mma_tile_sizes<DV, ncols>::T_C_VKQ;
++#if defined(TURING_MMA_AVAILABLE)
++    constexpr bool fp32_partial = output_partial && !needs_fixup && !is_fixup && DKQ == 256 && DV == 256 &&
++        ncols == 64 && nwarps*T_B_KQ::I == ncols;
++    using T_C_VKQ = std::conditional_t<fp32_partial, tile<16, 16, float>, T_C_VKQ_base>;
++#else
++    constexpr bool fp32_partial = false;
++    using T_C_VKQ = T_C_VKQ_base;
++#endif // defined(TURING_MMA_AVAILABLE)
+ 
+     constexpr int  cols_per_warp   = T_B_KQ::I;
+     constexpr int  cols_per_thread = get_cols_per_thread();
+@@ -1224,7 +1240,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+ 
+     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
+ #if defined(TURING_MMA_AVAILABLE)
+-    T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
++    T_C_VKQ VKQ_C[fp32_partial ? DV/T_C_VKQ::J : (cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J))];
+ #elif defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+     T_C_VKQ VKQ_C[DV % 32 != 0       ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J)];
+ #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+@@ -1413,7 +1429,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+         }
+ 
+ #if defined(TURING_MMA_AVAILABLE)
+-        if constexpr (cols_per_warp == 8) {
++        if constexpr (fp32_partial) {
++#pragma unroll
++            for (int i = 0; i < DV/T_C_VKQ::J; ++i) {
++#pragma unroll
++                for (int l = 0; l < T_C_VKQ::ne; ++l) {
++                    VKQ_C[i].x[l] *= KQ_max_scale[(l/2) % cols_per_thread];
++                }
++            }
++        } else if constexpr (cols_per_warp == 8) {
+             const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[cols_per_thread - 1]);
+ #pragma unroll
+             for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
+@@ -1509,7 +1533,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+         // KQ_cmr = KQ combine max rowsum
+         // Use the 16 bytes of padding in each Q column to store the meta data: KQ max, KQ rowsum, KQ max scale.
+ #if defined(TURING_MMA_AVAILABLE)
+-        const int jc_cwm = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(threadIdx.x % 4);
++        const int jc_cwm = threadIdx.y*cols_per_warp + T_C_VKQ_base::get_i(threadIdx.x % 4);
+         const float2 KQ_cmr = make_float2(KQ_max[threadIdx.x % cols_per_thread], KQ_rowsum[threadIdx.x % cols_per_thread]);
+         const bool thread_should_write = threadIdx.x % 4 < cols_per_thread;
+ #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+@@ -1618,6 +1642,31 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+         __syncthreads();
+     }
+ 
++    if constexpr (fp32_partial) {
++        static_assert(np == 1 && !needs_fixup && !is_fixup, "FP32 partial output requires complete tiles");
++        // Keep long-span numerators in FP32 through the global softmax merge.
++#pragma unroll
++        for (int i = 0; i < DV/T_C_VKQ::J; ++i) {
++#pragma unroll
++            for (int l = 0; l < T_C_VKQ::ne; ++l) {
++                const int jc = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(l);
++                const int query = jt*ncols1 + jc/ncols2;
++                const int head = jc % ncols2;
++                if (query >= int(ne01.z) || zt_gqa*ncols2 + head >= gqa_ratio) {
++                    continue;
++                }
++                const int row = query*ne02 + head;
++                const int value = i*T_C_VKQ::J + T_C_VKQ::get_j(l);
++                reinterpret_cast<float *>(dstk)[row*DV + value] = VKQ_C[i].x[l];
++                if (value == 0) {
++                    const float * meta = reinterpret_cast<const float *>(tile_Q) + jc*tile_stride + nbatch_combine;
++                    dstk_fixup[row] = make_float2(meta[0], meta[1]);
++                }
++            }
++        }
++        return;
++    }
++
+ #pragma unroll
+     for (int k00 = 0; k00 < DV/2; k00 += nbatch_combine) {
+         if constexpr (cols_per_warp == 8) {
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 95f2be2..f8f3f4d 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -8,11 +8,27 @@
+ #include "kv-stream-span-tuner.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <cstdlib>
++#include <fstream>
+ #include <limits>
++#include <mutex>
++#include <sstream>
++#include <string>
+ #include <unordered_map>
++#include <utility>
+ #include <vector>
+ 
++enum best_fattn_kernel {
++    BEST_FATTN_KERNEL_NONE    =   0,
++    BEST_FATTN_KERNEL_TILE    = 200,
++    BEST_FATTN_KERNEL_VEC     = 100,
++    BEST_FATTN_KERNEL_MMA_F16 = 400,
++};
++
++static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(int device, const ggml_tensor * dst);
++static void ggml_cuda_flash_attn_ext_standard(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+ __launch_bounds__(256, 1)
+ static __global__ void flash_attn_mask_to_sparse_indices(
+@@ -227,6 +243,7 @@ struct ggml_cuda_kv_stream_transfer_ring {
+     bool last_graph_bounded = false;
+     bool last_graph_streamed = false;
+     bool copy_sample_recorded = false;
++    std::vector<uint32_t> checked_query_shapes;
+ };
+ 
+ ggml_cuda_kv_stream_transfer_ring * ggml_cuda_kv_stream_transfer_ring_new(
+@@ -1778,6 +1795,530 @@ uint32_t ggml_cuda_kv_stream_last_ring_peak_occupancy(
+     return ring == nullptr ? 0 : ring->last_ring_peak_occupancy;
+ }
+ 
++static bool kv_stream_fp32_mma_supported(int device, const ggml_tensor * dst) {
++    const ggml_tensor * Q = dst->src[0];
++    const ggml_tensor * K = dst->src[1];
++    const ggml_tensor * V = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++    const int cc = ggml_cuda_info().devices[device].cc;
++    float max_bias, logit_softcap;
++    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
++    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
++        Q->type == GGML_TYPE_F32 && Q->ne[0] == 256 && V->ne[0] == 256 &&
++        Q->ne[1] > 1 && Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
++        Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8 &&
++        K->ne[1] % FATTN_KQ_STRIDE == 0 && mask != nullptr &&
++        mask->type == GGML_TYPE_F16 && dst->src[4] == nullptr &&
++        max_bias == 0.0f && logit_softcap == 0.0f &&
++        ggml_backend_cuda_kv_stream_get_attention_mode(K->type, V->type) == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT &&
++        ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_MMA_F16;
++}
++
++static void kv_stream_fp32_mma_resident(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const int nrows = int(ggml_nelements(dst)/256);
++    ggml_cuda_pool_alloc<float> numerator(ctx.pool(), ggml_nelements(dst));
++    ggml_cuda_pool_alloc<float2> meta(ctx.pool(), nrows);
++    // One GPU-resident span uses no streaming ring, host cache or page merge.
++    ggml_cuda_flash_attn_ext_mma_f16_partial_case<256, 256, 8, 8>(ctx, dst, numerator.ptr, meta.ptr);
++    const ggml_cuda_kernel_launch_params launch_params(dim3(nrows, 1, 1), dim3(256, 1, 1), 0, ctx.stream());
++    ggml_cuda_kernel_launch(kv_stream_normalize_chunk_results<256>, launch_params,
++        numerator.ptr, meta.ptr, static_cast<float *>(dst->data), nrows);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++enum kv_stream_reference_mode {
++    KV_STREAM_REFERENCE_STOCK = 0,
++    KV_STREAM_REFERENCE_FP32 = 1,
++    KV_STREAM_REFERENCE_MMA_PARTS = 2,
++    KV_STREAM_REFERENCE_VEC_PARTS = 3,
++};
++
++struct kv_stream_reference_plan {
++    int mode = KV_STREAM_REFERENCE_STOCK;
++    int parts = 1;
++    int64_t queries = 0;
++    std::vector<std::pair<int64_t, int64_t>> spans;
++};
++
++static uint64_t kv_stream_reference_shape(const ggml_tensor * dst) {
++    uint64_t hash = UINT64_C(14695981039346656037);
++    auto append = [&](uint64_t value) {
++        for (int i = 0; i < 8; ++i) {
++            hash = (hash ^ (value & 255))*UINT64_C(1099511628211);
++            value >>= 8;
++        }
++    };
++    for (int i = -1; i < 5; ++i) {
++        const ggml_tensor * tensor = i == -1 ? dst : dst->src[i];
++        append(tensor == nullptr ? 0 : 1);
++        if (tensor != nullptr) {
++            append(tensor->type);
++            for (int d = 0; d < GGML_MAX_DIMS; ++d) { append(tensor->ne[d]); }
++        }
++    }
++    for (int i = 0; i < 3; ++i) {
++        uint32_t value;
++        memcpy(&value, reinterpret_cast<const char *>(dst->op_params) + i*sizeof(value), sizeof(value));
++        append(value);
++    }
++    return hash;
++}
++
++static void kv_stream_record_reference_plan(const ggml_tensor * dst, const kv_stream_reference_plan & plan) {
++    const char * path = getenv("GGML_CUDA_KV_STREAM_RECORD_PLAN");
++    if (path == nullptr) { return; }
++    GGML_ASSERT(getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
++    GGML_ASSERT(ggml_backend_cuda_kv_stream_get_attention_mode(dst->src[1]->type, dst->src[2]->type) ==
++        GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT);
++    // Record arithmetic boundaries only. The reference owns its Q/K/V, mask and output.
++    std::ofstream output(path, std::ios::app);
++    GGML_ASSERT(output.good());
++    output << "1 " << kv_stream_reference_shape(dst) << ' ' << plan.mode << ' ' << plan.parts << ' '
++           << plan.queries << ' ' << plan.spans.size();
++    for (const auto & span : plan.spans) { output << ' ' << span.first << ' ' << span.second; }
++    output << '\n';
++    output.flush();
++    GGML_ASSERT(output.good());
++    GGML_LOG_INFO("kv_stream_plan_record: queries=%lld kv=%lld mode=%d spans=%zu file=%s\n",
++        (long long) dst->src[0]->ne[1], (long long) dst->src[1]->ne[1], plan.mode, plan.spans.size(), path);
++}
++
++static kv_stream_reference_plan kv_stream_read_reference_plan(const ggml_tensor * dst, const char * path) {
++    struct reader {
++        std::ifstream input;
++        size_t calls = 0;
++    };
++    static std::mutex mutex;
++    static std::unordered_map<std::string, reader> readers;
++    std::lock_guard<std::mutex> lock(mutex);
++    auto & source = readers[path];
++    if (!source.input.is_open()) { source.input.open(path); }
++    std::string line;
++    GGML_ASSERT(std::getline(source.input, line));
++    std::istringstream input(line);
++    int version;
++    uint64_t shape;
++    size_t spans;
++    kv_stream_reference_plan plan;
++    GGML_ASSERT(input >> version >> shape >> plan.mode >> plan.parts >> plan.queries >> spans);
++    GGML_ASSERT(version == 1 && shape == kv_stream_reference_shape(dst));
++    GGML_ASSERT(plan.mode >= KV_STREAM_REFERENCE_STOCK && plan.mode <= KV_STREAM_REFERENCE_VEC_PARTS);
++    GGML_ASSERT(plan.parts > 0 && plan.parts <= KV_STREAM_MAX_PARTS_PER_CHUNK);
++    GGML_ASSERT(plan.queries > 0 && plan.queries <= dst->src[0]->ne[1]);
++    GGML_ASSERT(spans > 0 && spans <= size_t(dst->src[1]->ne[1]/FATTN_KQ_STRIDE));
++    int64_t next = 0;
++    for (size_t i = 0; i < spans; ++i) {
++        int64_t begin, count;
++        GGML_ASSERT(input >> begin >> count);
++        GGML_ASSERT(begin == next && count > 0 && count % FATTN_KQ_STRIDE == 0);
++        GGML_ASSERT(count <= dst->src[1]->ne[1] - next);
++        plan.spans.emplace_back(begin, count);
++        next += count;
++    }
++    GGML_ASSERT(next == dst->src[1]->ne[1]);
++    std::string trailing;
++    GGML_ASSERT(!(input >> trailing));
++    GGML_LOG_INFO("kv_stream_plan_replay: call=%zu queries=%lld kv=%lld mode=%d spans=%zu file=%s\n",
++        ++source.calls, (long long) dst->src[0]->ne[1], (long long) dst->src[1]->ne[1],
++        plan.mode, plan.spans.size(), path);
++    return plan;
++}
++
++static void kv_stream_execute_reference_plan(
++        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const kv_stream_reference_plan & plan) {
++    if (plan.mode == KV_STREAM_REFERENCE_STOCK || plan.mode == KV_STREAM_REFERENCE_FP32) {
++        GGML_ASSERT(plan.spans.size() == 1);
++        if (plan.mode == KV_STREAM_REFERENCE_FP32) {
++            GGML_ASSERT(kv_stream_fp32_mma_supported(ctx.device, dst));
++            kv_stream_fp32_mma_resident(ctx, dst);
++        } else {
++            ggml_cuda_flash_attn_ext_standard(ctx, dst);
++        }
++        return;
++    }
++
++    const ggml_tensor * Q = dst->src[0];
++    const ggml_tensor * K = dst->src[1];
++    const ggml_tensor * V = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++    GGML_ASSERT(Q->ne[0] == KV_STREAM_HEAD_DIM && V->ne[0] == KV_STREAM_HEAD_DIM);
++    GGML_ASSERT(Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1);
++    GGML_ASSERT(ggml_backend_cuda_kv_stream_get_attention_mode(K->type, V->type) ==
++        GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT);
++    const bool mma = plan.mode == KV_STREAM_REFERENCE_MMA_PARTS;
++    GGML_ASSERT(!mma || (plan.parts == 1 && kv_stream_fp32_mma_supported(ctx.device, dst)));
++#ifdef GGML_CUDA_FA_ALL_QUANTS
++    const auto native_partial = kv_stream_resolve_native_partial(K->type, V->type);
++    GGML_ASSERT(mma || native_partial != nullptr);
++#else
++    GGML_ASSERT(mma);
++#endif
++    const int nrows = ggml_nrows(dst);
++    const int64_t rows_per_query = nrows/Q->ne[1];
++    const size_t workspace_rows = size_t(plan.queries*rows_per_query);
++    ggml_cuda_pool_alloc<float> parts(ctx.pool(), plan.parts*workspace_rows*dst->ne[0]);
++    ggml_cuda_pool_alloc<float2> meta(ctx.pool(), plan.parts*workspace_rows);
++    ggml_cuda_pool_alloc<float> accumulator(ctx.pool(), ggml_nelements(dst));
++    ggml_cuda_pool_alloc<float2> accumulator_meta(ctx.pool(), nrows);
++    for (size_t i = 0; i < plan.spans.size(); ++i) {
++        const auto & span = plan.spans[i];
++        ggml_tensor k = *K;
++        ggml_tensor v = *V;
++        k.data = static_cast<char *>(K->data) + span.first*K->nb[1];
++        v.data = static_cast<char *>(V->data) + span.first*V->nb[1];
++        k.ne[1] = v.ne[1] = span.second;
++        for (int64_t begin = 0; begin < Q->ne[1]; begin += plan.queries) {
++            const int64_t count = std::min(plan.queries, Q->ne[1] - begin);
++            ggml_tensor q = *Q;
++            q.data = static_cast<char *>(Q->data) + begin*Q->nb[1];
++            q.ne[1] = count;
++            ggml_tensor m{};
++            if (mask != nullptr) {
++                m = *mask;
++                m.data = static_cast<char *>(mask->data) + span.first*mask->nb[0] + begin*mask->nb[1];
++                m.ne[0] = span.second;
++                m.ne[1] = count;
++            }
++            ggml_tensor result = *dst;
++            result.ne[2] = count;
++            result.src[0] = &q;
++            result.src[1] = &k;
++            result.src[2] = &v;
++            result.src[3] = mask == nullptr ? nullptr : &m;
++            if (mma) {
++                ggml_cuda_flash_attn_ext_mma_f16_partial_case<256, 256, 8, 8>(ctx, &result, parts.ptr, meta.ptr);
++            } else {
++#ifdef GGML_CUDA_FA_ALL_QUANTS
++                native_partial(ctx, &result, parts.ptr, meta.ptr, plan.parts);
++#endif
++            }
++            const int tile_rows = int(count*rows_per_query);
++            const size_t offset = size_t(begin*rows_per_query);
++            const ggml_cuda_kernel_launch_params launch(dim3(tile_rows, 1, 1), dim3(KV_STREAM_HEAD_DIM, 1, 1), 0, ctx.stream());
++            ggml_cuda_kernel_launch(kv_stream_accumulate_chunk_results<KV_STREAM_HEAD_DIM>, launch,
++                parts.ptr, meta.ptr, accumulator.ptr + offset*dst->ne[0], accumulator_meta.ptr + offset,
++                tile_rows, i == 0, plan.parts);
++            CUDA_CHECK(cudaGetLastError());
++        }
++    }
++    const ggml_cuda_kernel_launch_params launch(dim3(nrows, 1, 1), dim3(KV_STREAM_HEAD_DIM, 1, 1), 0, ctx.stream());
++    ggml_cuda_kernel_launch(kv_stream_normalize_chunk_results<KV_STREAM_HEAD_DIM>, launch,
++        accumulator.ptr, accumulator_meta.ptr, static_cast<float *>(dst->data), nrows);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++static void kv_stream_replay_reference_plan(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const char * path) {
++    GGML_ASSERT(getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
++    for (int i : {1, 2}) {
++        const ggml_tensor * tensor = dst->src[i];
++        while (tensor->view_src != nullptr) { tensor = tensor->view_src; }
++        GGML_ASSERT(tensor->buffer != nullptr && !ggml_backend_buffer_is_host(tensor->buffer));
++    }
++    kv_stream_execute_reference_plan(ctx, dst, kv_stream_read_reference_plan(dst, path));
++}
++
++static void kv_stream_attention_oracle(
++        const ggml_tensor * dst, uint32_t layer, size_t worst_element,
++        const std::vector<float> & streamed, const std::vector<float> & ordinary,
++        const std::vector<float> & resident_fp32) {
++    const ggml_tensor * Q = dst->src[0];
++    const ggml_tensor * K = dst->src[1];
++    const ggml_tensor * V = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++    float scale, max_bias, logit_softcap;
++    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
++    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
++    auto supported_type = [](ggml_type type) {
++        return type == GGML_TYPE_Q5_1 || type == GGML_TYPE_F16 || type == GGML_TYPE_F32;
++    };
++    if (!std::isfinite(scale) || max_bias != 0.0f || logit_softcap != 0.0f || dst->src[4] != nullptr ||
++            !supported_type(K->type) || !supported_type(V->type) ||
++            Q->ne[2] % K->ne[2] != 0 || Q->nb[0] != sizeof(float) ||
++            (mask != nullptr && (mask->ne[2] != 1 || mask->ne[3] != 1)) ||
++            !ggml_is_contiguous(dst)) {
++        GGML_LOG_WARN("kv_stream_attention_oracle_skip: layer=%u reason=unsupported_parameters_or_layout\n", layer);
++        return;
++    }
++
++    const int64_t dim = Q->ne[0];
++    const int64_t queries = Q->ne[1];
++    const int64_t heads = Q->ne[2];
++    const int64_t tokens = K->ne[1];
++    const int64_t gqa = heads/K->ne[2];
++    std::vector<float> q_values(ggml_nbytes(Q)/sizeof(float));
++    ggml_backend_tensor_get(Q, q_values.data(), 0, ggml_nbytes(Q));
++    std::vector<ggml_fp16_t> mask_values(mask == nullptr ? 0 : ggml_nbytes(mask)/sizeof(ggml_fp16_t));
++    if (mask != nullptr) {
++        ggml_backend_tensor_get(mask, mask_values.data(), 0, ggml_nbytes(mask));
++    }
++    std::vector<std::pair<int64_t, int64_t>> samples;
++    auto add_sample = [&](int64_t query, int64_t head) {
++        const auto sample = std::make_pair(query, head);
++        if (std::find(samples.begin(), samples.end(), sample) == samples.end()) {
++            samples.push_back(sample);
++        }
++    };
++    for (int64_t head : {int64_t(0), gqa - 1, heads/2, heads - 1}) {
++        for (int64_t query : {int64_t(0), queries/2, queries - 1}) {
++            add_sample(query, head);
++        }
++    }
++    add_sample(int64_t(worst_element)/(dim*heads), (int64_t(worst_element)/dim) % heads);
++
++    auto round_f16 = [](float value) {
++        return ggml_fp16_to_fp32(ggml_fp32_to_fp16(value));
++    };
++    auto decode_row = [&](const ggml_tensor * tensor, int64_t token, int64_t head, float * values) {
++        const auto * data = static_cast<const char *>(tensor->data) + token*tensor->nb[1] + head*tensor->nb[2];
++        if (tensor->type == GGML_TYPE_F32) {
++            memcpy(values, data, dim*sizeof(float));
++        } else {
++            ggml_get_type_traits(tensor->type)->to_float(data, values, dim);
++        }
++    };
++    std::vector<float> keys(tokens*dim), values(tokens*dim);
++    std::vector<float> keys_f16(tokens*dim), values_f16(tokens*dim);
++    std::vector<double> q(dim), scores(tokens), answer(dim);
++    int64_t decoded_head = -1;
++    for (const auto & sample : samples) {
++        const int64_t query = sample.first;
++        const int64_t head = sample.second;
++        const int64_t kv_head = head/gqa;
++        if (kv_head != decoded_head) {
++            for (int64_t token = 0; token < tokens; ++token) {
++                decode_row(K, token, kv_head, keys.data() + token*dim);
++                decode_row(V, token, kv_head, values.data() + token*dim);
++            }
++            for (size_t i = 0; i < keys.size(); ++i) {
++                keys_f16[i] = round_f16(keys[i]);
++                values_f16[i] = round_f16(values[i]);
++            }
++            decoded_head = kv_head;
++        }
++        for (int mode = 0; mode < 2; ++mode) {
++            const auto & mode_keys = mode == 0 ? keys_f16 : keys;
++            const auto & mode_values = mode == 0 ? values_f16 : values;
++            const size_t q_offset = (query*Q->nb[1] + head*Q->nb[2])/sizeof(float);
++            for (int64_t d = 0; d < dim; ++d) {
++                const float value = q_values[q_offset + d];
++                // MMA rounds Q before multiplying by the rounded scale.
++                q[d] = mode == 0 ? round_f16(round_f16(value)*round_f16(scale)) : double(value)*scale;
++            }
++            double maximum = -std::numeric_limits<double>::infinity();
++            int64_t visible = 0;
++            bool inputs_finite = true;
++            for (int64_t token = 0; token < tokens; ++token) {
++                const double bias = mask == nullptr ? 0.0 : ggml_fp16_to_fp32(
++                    mask_values[query*(mask->nb[1]/sizeof(ggml_fp16_t)) + token]);
++                if (!std::isfinite(bias)) {
++                    inputs_finite &= bias == -std::numeric_limits<double>::infinity();
++                    scores[token] = -std::numeric_limits<double>::infinity();
++                    continue;
++                }
++                double score = bias;
++                for (int64_t d = 0; d < dim; ++d) {
++                    score += q[d]*mode_keys[token*dim + d];
++                }
++                scores[token] = score;
++                inputs_finite &= std::isfinite(score);
++                maximum = std::max(maximum, score);
++                ++visible;
++            }
++            std::fill(answer.begin(), answer.end(), 0.0);
++            double denominator = 0.0;
++            for (int64_t token = 0; token < tokens; ++token) {
++                if (!std::isfinite(scores[token])) { continue; }
++                const double weight = std::exp(scores[token] - maximum);
++                denominator += weight;
++                for (int64_t d = 0; d < dim; ++d) {
++                    answer[d] += weight*mode_values[token*dim + d];
++                }
++            }
++            double streamed_max = 0.0, ordinary_max = 0.0, resident_max = 0.0;
++            double streamed_squared = 0.0, ordinary_squared = 0.0, resident_squared = 0.0;
++            bool finite = inputs_finite && visible > 0 && std::isfinite(denominator) && denominator > 0.0;
++            const size_t offset = (query*heads + head)*dim;
++            for (int64_t d = 0; d < dim; ++d) {
++                const double expected = answer[d]/denominator;
++                finite &= std::isfinite(expected) && std::isfinite(streamed[offset + d]) &&
++                    std::isfinite(ordinary[offset + d]) && std::isfinite(resident_fp32[offset + d]);
++                const double stream_error = double(streamed[offset + d]) - expected;
++                const double ordinary_error = double(ordinary[offset + d]) - expected;
++                const double resident_error = double(resident_fp32[offset + d]) - expected;
++                streamed_max = std::max(streamed_max, std::abs(stream_error));
++                ordinary_max = std::max(ordinary_max, std::abs(ordinary_error));
++                resident_max = std::max(resident_max, std::abs(resident_error));
++                streamed_squared += stream_error*stream_error;
++                ordinary_squared += ordinary_error*ordinary_error;
++                resident_squared += resident_error*resident_error;
++            }
++            GGML_LOG_WARN("kv_stream_attention_oracle: layer=%u queries=%lld kv=%lld query=%lld head=%lld mode=%s visible=%lld worst_row=%d streamed_max_abs=%.9g streamed_rmse=%.9g ordinary_max_abs=%.9g ordinary_rmse=%.9g resident_fp32_max_abs=%.9g resident_fp32_rmse=%.9g finite=%d\n",
++                layer, (long long) queries, (long long) tokens, (long long) query, (long long) head,
++                mode == 0 ? "f16_inputs" : "quantized_inputs", (long long) visible,
++                int(size_t(offset) == worst_element/size_t(dim)*size_t(dim)),
++                streamed_max, std::sqrt(streamed_squared/dim), ordinary_max, std::sqrt(ordinary_squared/dim),
++                resident_max, std::sqrt(resident_squared/dim), int(finite));
++        }
++    }
++}
++
++static void kv_stream_check_attention(
++        ggml_backend_cuda_context & ctx, ggml_tensor * dst,
++        ggml_cuda_kv_stream_transfer_ring * ring,
++        ggml_cuda_kv_stream_resident_cache * cache,
++        uint32_t layer, uint32_t resident_pages,
++        const void * last_k, const void * last_v, int64_t last_token, int64_t last_tokens,
++        const kv_stream_reference_plan * plan) {
++    const ggml_tensor * Q = dst->src[0];
++    const ggml_tensor * K = dst->src[1];
++    const ggml_tensor * V = dst->src[2];
++    const uint32_t shape = Q->ne[1] == 1 ? 1 : (Q->ne[1] == 2 ? 2 : 4);
++    if (getenv("GGML_CUDA_KV_STREAM_CHECK_ATTENTION") == nullptr ||
++            K->ne[1] > 16384 || (layer != 0 && layer != cache->layer_count/2 && layer + 1 != cache->layer_count)) {
++        return;
++    }
++    if (ring->checked_query_shapes.size() < cache->layer_count) {
++        ring->checked_query_shapes.resize(cache->layer_count, 0);
++    }
++    if ((ring->checked_query_shapes[layer] & shape) != 0) { return; }
++    ring->checked_query_shapes[layer] |= shape;
++
++    // Compare the same Q/K/V against ordinary CUDA attention, once per query shape.
++    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++    size_t k_bad = 0;
++    size_t v_bad = 0;
++    size_t k_bad_visible = 0;
++    size_t v_bad_visible = 0;
++    int64_t k_bad_row = -1;
++    int64_t v_bad_row = -1;
++    size_t last_k_bad = 0;
++    size_t last_v_bad = 0;
++    size_t last_k_bad_visible = 0;
++    size_t last_v_bad_visible = 0;
++    int64_t last_k_bad_row = -1;
++    int64_t last_v_bad_row = -1;
++    {
++        const size_t resident_tokens = size_t(resident_pages)*cache->page_tokens;
++        std::vector<uint8_t> visible(K->ne[1], 1);
++        const ggml_tensor * mask = dst->src[3];
++        if (mask != nullptr) {
++            std::vector<uint16_t> values(ggml_nbytes(mask)/sizeof(uint16_t));
++            ggml_backend_tensor_get(mask, values.data(), 0, ggml_nbytes(mask));
++            std::fill(visible.begin(), visible.end(), 0);
++            for (int64_t query = 0; query < Q->ne[1]; ++query) {
++                for (size_t row = 0; row < visible.size(); ++row) {
++                    visible[row] |= (values[query*(mask->nb[1]/sizeof(uint16_t)) + row] & 0x7c00) != 0x7c00;
++                }
++            }
++        }
++        const size_t k_plane = size_t(resident_pages)*cache->page_tokens*K->nb[1];
++        char * base = cache->pool_data + cache->scratch_bytes + cache->layer_offsets[layer]*cache->page_bytes;
++        auto check_bytes = [&](const void * gpu, const void * host, size_t bytes,
++                size_t row_bytes, size_t first_token, size_t & visible_bad, int64_t & first_row) {
++            std::vector<uint8_t> actual(bytes);
++            CUDA_CHECK(cudaMemcpy(actual.data(), gpu, bytes, cudaMemcpyDeviceToHost));
++            const auto * expected = static_cast<const uint8_t *>(host);
++            size_t bad = 0;
++            for (size_t i = 0; i < bytes; ++i) {
++                if (actual[i] == expected[i]) { continue; }
++                ++bad;
++                if (visible[first_token + i/row_bytes]) {
++                    ++visible_bad;
++                    if (first_row < 0) { first_row = int64_t(first_token + i/row_bytes); }
++                }
++            }
++            return bad;
++        };
++        k_bad = check_bytes(base, K->data, k_plane, K->nb[1], 0, k_bad_visible, k_bad_row);
++        v_bad = check_bytes(base + k_plane, V->data, resident_tokens*V->nb[1], V->nb[1], 0, v_bad_visible, v_bad_row);
++        if (last_k != nullptr) {
++            last_k_bad = check_bytes(last_k, static_cast<const char *>(K->data) + last_token*K->nb[1],
++                last_tokens*K->nb[1], K->nb[1], last_token, last_k_bad_visible, last_k_bad_row);
++            last_v_bad = check_bytes(last_v, static_cast<const char *>(V->data) + last_token*V->nb[1],
++                last_tokens*V->nb[1], V->nb[1], last_token, last_v_bad_visible, last_v_bad_row);
++        }
++    }
++
++    ggml_cuda_pool_alloc<char> k_copy(ctx.pool(), ggml_nbytes(K));
++    ggml_cuda_pool_alloc<char> v_copy(ctx.pool(), ggml_nbytes(V));
++    CUDA_CHECK(cudaMemcpyAsync(k_copy.get(), K->data, ggml_nbytes(K), cudaMemcpyHostToDevice, ctx.stream()));
++    CUDA_CHECK(cudaMemcpyAsync(v_copy.get(), V->data, ggml_nbytes(V), cudaMemcpyHostToDevice, ctx.stream()));
++    ggml_tensor reference_k = *K;
++    ggml_tensor reference_v = *V;
++    reference_k.data = k_copy.get();
++    reference_v.data = v_copy.get();
++    ggml_tensor reference = *dst;
++    reference.src[1] = &reference_k;
++    reference.src[2] = &reference_v;
++    reference.data = nullptr;
++    ggml_cuda_pool_alloc<char> output(ctx.pool(), ggml_cuda_flash_attn_ext_get_alloc_size(ctx.device, &reference));
++    reference.data = output.get();
++    ggml_cuda_flash_attn_ext(ctx, &reference);
++
++    std::vector<float> expected(ggml_nelements(dst));
++    std::vector<float> actual(expected.size());
++    CUDA_CHECK(cudaMemcpyAsync(expected.data(), reference.data, expected.size()*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
++    CUDA_CHECK(cudaMemcpyAsync(actual.data(), dst->data, actual.size()*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++    double max_abs = 0.0;
++    double squared = 0.0;
++    double reference_squared = 0.0;
++    bool finite = true;
++    size_t worst_element = 0;
++    for (size_t i = 0; i < actual.size(); ++i) {
++        finite &= std::isfinite(expected[i]) && std::isfinite(actual[i]);
++        const double error = double(actual[i]) - expected[i];
++        if (std::abs(error) > max_abs) { worst_element = i; }
++        max_abs = std::max(max_abs, std::abs(error));
++        squared += error*error;
++        reference_squared += double(expected[i])*expected[i];
++    }
++    GGML_LOG_WARN("kv_stream_attention_check: layer=%u layers=%u queries=%lld kv=%lld resident=%u kernel=%d k_bad=%zu v_bad=%zu k_bad_visible=%zu v_bad_visible=%zu k_bad_row=%lld v_bad_row=%lld stream_checked=%d stream_token=%lld stream_tokens=%lld stream_k_bad=%zu stream_v_bad=%zu stream_k_bad_visible=%zu stream_v_bad_visible=%zu stream_k_bad_row=%lld stream_v_bad_row=%lld max_abs=%.9g rmse=%.9g relative_l2=%.9g finite=%d\n",
++        layer, cache->layer_count, (long long) Q->ne[1], (long long) K->ne[1], resident_pages*cache->page_tokens,
++        int(ggml_cuda_get_best_fattn_kernel(ctx.device, dst)), k_bad, v_bad, k_bad_visible, v_bad_visible,
++        (long long) k_bad_row, (long long) v_bad_row, int(last_k != nullptr),
++        (long long) last_token, (long long) last_tokens, last_k_bad, last_v_bad,
++        last_k_bad_visible, last_v_bad_visible, (long long) last_k_bad_row, (long long) last_v_bad_row, max_abs,
++        std::sqrt(squared/actual.size()), std::sqrt(squared/std::max(reference_squared, 1e-30)), int(finite));
++    if (plan != nullptr && !plan->spans.empty()) {
++        kv_stream_execute_reference_plan(ctx, &reference, *plan);
++        std::vector<float> partition(actual.size());
++        CUDA_CHECK(cudaMemcpyAsync(partition.data(), reference.data, partition.size()*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
++        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++        double partition_max_abs = 0.0;
++        double partition_squared = 0.0;
++        bool partition_finite = true;
++        for (size_t i = 0; i < actual.size(); ++i) {
++            partition_finite &= std::isfinite(partition[i]) && std::isfinite(actual[i]);
++            const double error = double(actual[i]) - partition[i];
++            partition_max_abs = std::max(partition_max_abs, std::abs(error));
++            partition_squared += error*error;
++        }
++        GGML_LOG_WARN("kv_stream_partition_check: layer=%u queries=%lld kv=%lld spans=%zu max_abs=%.9g rmse=%.9g finite=%d\n",
++            layer, (long long) Q->ne[1], (long long) K->ne[1], plan->spans.size(), partition_max_abs,
++            std::sqrt(partition_squared/actual.size()), int(partition_finite));
++    }
++    if (kv_stream_fp32_mma_supported(ctx.device, dst)) {
++        std::vector<float> resident_fp32(actual.size());
++        kv_stream_fp32_mma_resident(ctx, &reference);
++        CUDA_CHECK(cudaMemcpyAsync(resident_fp32.data(), reference.data,
++            resident_fp32.size()*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
++        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++        double pair_max_abs = 0.0;
++        double pair_squared = 0.0;
++        for (size_t i = 0; i < actual.size(); ++i) {
++            const double error = double(actual[i]) - resident_fp32[i];
++            pair_max_abs = std::max(pair_max_abs, std::abs(error));
++            pair_squared += error*error;
++        }
++        GGML_LOG_WARN("kv_stream_fp32_pair: layer=%u queries=%lld kv=%lld max_abs=%.9g rmse=%.9g\n",
++            layer, (long long) Q->ne[1], (long long) K->ne[1], pair_max_abs, std::sqrt(pair_squared/actual.size()));
++        kv_stream_attention_oracle(dst, layer, worst_element, actual, expected, resident_fp32);
++    }
++}
++
+ void ggml_cuda_flash_attn_ext_streamed(
+         ggml_backend_cuda_context & ctx,
+         ggml_tensor * dst,
+@@ -1934,7 +2475,8 @@ void ggml_cuda_flash_attn_ext_streamed(
+ 
+     const bool use_mma_prefill = !convert_to_f16 &&
+         Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+-        mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
++        mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8 &&
++        ggml_cuda_get_best_fattn_kernel(ctx.device, dst) == BEST_FATTN_KERNEL_MMA_F16;
+     const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
+     GGML_ASSERT(partial_count > 0 && partial_count <= KV_STREAM_MAX_PARTS_PER_CHUNK);
+     GGML_ASSERT(Q->ne[1] > 0 && nrows % Q->ne[1] == 0);
+@@ -1943,6 +2485,12 @@ void ggml_cuda_flash_attn_ext_streamed(
+         std::min<int64_t>(Q->ne[1], KV_STREAM_QUERY_WORKSPACE_TOKENS);
+     const size_t workspace_rows = size_t(workspace_queries*rows_per_query);
+     const size_t workspace_elements = workspace_rows*dst->ne[0];
++    const bool record_plan = getenv("GGML_CUDA_KV_STREAM_RECORD_PLAN") != nullptr;
++    const bool capture_plan = !convert_to_f16 && (record_plan || getenv("GGML_CUDA_KV_STREAM_CHECK_ATTENTION") != nullptr);
++    kv_stream_reference_plan reference_plan;
++    reference_plan.mode = use_mma_prefill ? KV_STREAM_REFERENCE_MMA_PARTS : KV_STREAM_REFERENCE_VEC_PARTS;
++    reference_plan.parts = partial_count;
++    reference_plan.queries = workspace_queries;
+ 
+     ggml_cuda_pool & pool = ctx.pool();
+     ggml_cuda_pool_alloc<float> parts(pool);
+@@ -2220,10 +2768,22 @@ void ggml_cuda_flash_attn_ext_streamed(
+         staged_dst.src[2] = convert_to_f16 ? &converted_v : &staged_v;
+         staged_dst.src[3] = staged_mask_ptr;
+ 
+-        // Preserve normal CUDA flash attention when the active cache is fully resident or fits in one streamed page.
+-        // This avoids a partial reduction and keeps logits identical to a non-streamed cache.
++        // Keep MMA numerator precision the same before and after the first spill.
+         if (!convert_to_f16 && (streamed_chunks.empty() || nchunks == 1)) {
+-            ggml_cuda_flash_attn_ext(ctx, &staged_dst);
++            const bool fp32 = use_mma_prefill && kv_stream_fp32_mma_supported(ctx.device, &staged_dst);
++            if (fp32) {
++                kv_stream_fp32_mma_resident(ctx, &staged_dst);
++                if (resident_cache != nullptr) {
++                    ++resident_cache->stats.mma_prefill_attention_spans;
++                }
++            } else {
++                ggml_cuda_flash_attn_ext(ctx, &staged_dst);
++            }
++            if (record_plan) {
++                reference_plan.mode = fp32 ? KV_STREAM_REFERENCE_FP32 : KV_STREAM_REFERENCE_STOCK;
++                reference_plan.spans.emplace_back(desc.token_begin, desc.token_count);
++                kv_stream_record_reference_plan(dst, reference_plan);
++            }
+             if (desc.streamed) {
+                 if (graph_planned) {
+                     kv_stream_graph_release(transfer_ring, desc.request_index, ctx.stream());
+@@ -2236,6 +2796,7 @@ void ggml_cuda_flash_attn_ext_streamed(
+         }
+ 
+         GGML_ASSERT(needs_partial_reduction);
++        if (capture_plan) { reference_plan.spans.emplace_back(desc.token_begin, desc.token_count); }
+ 
+         // Keep each staged KV span alive while all bounded query tiles consume it.
+         // This bounds vector scratch without issuing another H2D transfer for the span.
+@@ -2257,7 +2818,7 @@ void ggml_cuda_flash_attn_ext_streamed(
+             }
+ 
+             ggml_tensor query_dst = staged_dst;
+-            query_dst.ne[1] = query_count;
++            query_dst.ne[2] = query_count;
+             query_dst.src[0] = &query_q;
+             query_dst.src[3] = query_mask_ptr;
+ 
+@@ -2323,6 +2884,15 @@ void ggml_cuda_flash_attn_ext_streamed(
+     ggml_cuda_kernel_launch(kv_stream_normalize_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
+         accumulator.ptr, accumulator_meta.ptr, static_cast<float *>(dst->data), nrows);
+     CUDA_CHECK(cudaGetLastError());
++    if (record_plan) { kv_stream_record_reference_plan(dst, reference_plan); }
++    if (!streamed_chunks.empty() && resident_cache != nullptr) {
++        // Cross-layer prefetch can reuse released ring slots; inspect them only without it.
++        const auto & last = chunks[streamed_chunks.back()];
++        kv_stream_check_attention(ctx, dst, transfer_ring, resident_cache, resident_layer, resident_layer_pages,
++            graph_planned ? nullptr : last.k_stage, graph_planned ? nullptr : last.v_stage,
++            graph_planned ? 0 : last.token_begin, graph_planned ? 0 : block_tokens,
++            capture_plan ? &reference_plan : nullptr);
++    }
+ }
+ 
+ template <int DKQ, int DV, int ncols2>
+@@ -2656,14 +3226,6 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     GGML_ABORT("fatal error");
+ }
+ 
+-// Best FlashAttention kernel for a specific GPU:
+-enum best_fattn_kernel {
+-    BEST_FATTN_KERNEL_NONE    =   0,
+-    BEST_FATTN_KERNEL_TILE    = 200,
+-    BEST_FATTN_KERNEL_VEC     = 100,
+-    BEST_FATTN_KERNEL_MMA_F16 = 400,
+-};
+-
+ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
+     switch (type) {
+         case GGML_TYPE_F32:
+@@ -2898,6 +3460,20 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+ 
+ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_set_device(ctx.device);
++    if (const char * path = getenv("GGML_CUDA_KV_STREAM_REPLAY_PLAN")) {
++        kv_stream_replay_reference_plan(ctx, dst, path);
++        return;
++    }
++    if (getenv("GGML_CUDA_KV_STREAM_FP32_REFERENCE") != nullptr && kv_stream_fp32_mma_supported(ctx.device, dst)) {
++        GGML_LOG_INFO("kv_stream_fp32_reference: queries=%lld kv=%lld\n",
++            (long long) dst->src[0]->ne[1], (long long) dst->src[1]->ne[1]);
++        kv_stream_fp32_mma_resident(ctx, dst);
++        return;
++    }
++    ggml_cuda_flash_attn_ext_standard(ctx, dst);
++}
++
++static void ggml_cuda_flash_attn_ext_standard(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+         case BEST_FATTN_KERNEL_NONE:
+             GGML_ABORT("fatal error");
+diff --git a/scripts/run_kv_multislot_tests.py b/scripts/run_kv_multislot_tests.py
+new file mode 100644
+index 0000000..dc883d5
+--- /dev/null
++++ b/scripts/run_kv_multislot_tests.py
+@@ -0,0 +1,711 @@
++#!/usr/bin/env python3
++"""Build and test the pinned adaptive-KV patch entirely under /mnt/ramdisk."""
++
++import argparse
++import csv
++import concurrent.futures
++import hashlib
++import json
++import os
++from pathlib import Path
++import re
++import shutil
++import signal
++import socket
++import subprocess
++import sys
++import tarfile
++import threading
++import time
++import traceback
++import urllib.error
++import urllib.request
++
++REPOSITORY = "https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming.git"
++BASE = "d7680c67b89f7cd4e3069b4bc2f26747aa588e3d"
++ROOT = Path("/mnt/ramdisk")
++GIB = 1024**3
++TESTS = ["test-kv-stream-" + suffix for suffix in (
++    "plan", "config", "softmax", "bench-config", "cuda-buffer", "cuda-attn", "cuda-set-rows")]
++
++
++def write_json(path, data):
++    path.write_text(json.dumps(data, indent=2) + "\n")
++
++
++def stop(process):
++    if process.poll() is None:
++        try:
++            os.killpg(process.pid, signal.SIGTERM)
++            process.wait(timeout=10)
++        except (ProcessLookupError, subprocess.TimeoutExpired):
++            if process.poll() is None:
++                os.killpg(process.pid, signal.SIGKILL)
++                process.wait()
++
++
++class Runner:
++    def __init__(self, workspace, args):
++        self.workspace = workspace
++        self.args = args
++        self.results = workspace / (
++            "results-" + time.strftime("%Y%m%d-%H%M%S") + "-" + str(os.getpid()) if args.resume else "results")
++        self.results.mkdir()
++        self.env = os.environ.copy()
++        # Avoid inherited llama flags and speculative settings changing a test.
++        for key in list(self.env):
++            if key.startswith("LLAMA_ARG_"):
++                del self.env[key]
++        self.env.pop("GGML_CUDA_KV_STREAM_CHECK_ATTENTION", None)
++        self.env.pop("GGML_CUDA_KV_STREAM_FP32_REFERENCE", None)
++        self.env.pop("GGML_CUDA_KV_STREAM_RECORD_PLAN", None)
++        self.env.pop("GGML_CUDA_KV_STREAM_REPLAY_PLAN", None)
++        for key in ("TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "CUDA_CACHE_PATH", "CCACHE_DIR"):
++            path = workspace / key.lower()
++            path.mkdir(exist_ok=bool(args.resume))
++            self.env[key] = str(path)
++        self.env.update(PYTHONDONTWRITEBYTECODE="1", GIT_CONFIG_NOSYSTEM="1",
++                        GIT_CONFIG_GLOBAL="/dev/null", PYTHONPYCACHEPREFIX=str(workspace / "pycache"),
++                        LLAMA_KV_STREAM_TRACE="1")
++        self.processes = []
++        self.lock = threading.Lock()
++        self.done = threading.Event()
++        self.fault = None
++        self.stages = []
++        self.peak_workspace_bytes = 0
++        self.monitor = threading.Thread(target=self.sample, daemon=True)
++        self.monitor.start()
++
++    def sample(self):
++        fields = "index,name,memory.used,memory.total,utilization.gpu,utilization.memory,temperature.gpu,power.draw"
++        with (self.results / "resources.jsonl").open("w") as output:
++            count = 0
++            while not self.done.is_set():
++                sample = {"time": time.time(), "free_workspace_bytes": shutil.disk_usage(self.workspace).free}
++                try:
++                    gpu = subprocess.run(["nvidia-smi", "--query-gpu=" + fields,
++                                          "--format=csv,noheader,nounits"], env=self.env,
++                                         cwd=self.workspace, capture_output=True, text=True, timeout=4)
++                    sample["gpu_csv"] = gpu.stdout.strip()
++                    sample["gpu_query_exit"] = gpu.returncode
++                    sample["meminfo"] = {line.split(":")[0]: line.split(":")[1].strip()
++                                         for line in Path("/proc/meminfo").read_text().splitlines()
++                                         if line.startswith(("MemAvailable:", "SwapFree:"))}
++                    if count % 6 == 0:
++                        used = 0
++                        for directory, _, names in os.walk(self.workspace, followlinks=False):
++                            for name in names:
++                                path = Path(directory) / name
++                                try:
++                                    if not path.is_symlink():
++                                        used += path.stat().st_blocks * 512
++                                except FileNotFoundError:
++                                    pass
++                        self.peak_workspace_bytes = max(self.peak_workspace_bytes, used)
++                        sample["workspace_bytes"] = used
++                        if used > 23 * GIB:
++                            self.fault = "workspace reached 23 GiB; stopped to preserve result space"
++                    if sample["free_workspace_bytes"] < GIB:
++                        self.fault = "less than 1 GiB free on ramdisk; stopped to preserve result space"
++                    if self.fault:
++                        with self.lock:
++                            running = list(self.processes)
++                        for process in running:
++                            stop(process)
++                except Exception as error:
++                    sample["monitor_error"] = str(error)
++                output.write(json.dumps(sample) + "\n")
++                output.flush()
++                count += 1
++                self.done.wait(5)
++
++    def start(self, name, command):
++        if self.fault:
++            raise RuntimeError(self.fault)
++        log = (self.results / (name + ".log")).open("wb")
++        started = time.time()
++        process = subprocess.Popen([str(item) for item in command], cwd=self.workspace, env=self.env,
++                                   stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
++        log.close()
++        with self.lock:
++            self.processes.append(process)
++        stage = {"name": name, "command": [str(item) for item in command], "started": started}
++        self.stages.append(stage)
++        write_json(self.results / "stages.json", self.stages)
++        print("RUN", name, flush=True)
++        return process, stage
++
++    def finish(self, process, stage, timeout, accepted=(0,)):
++        deadline = time.monotonic() + timeout
++        next_report = time.monotonic() + 60
++        while process.poll() is None:
++            now = time.monotonic()
++            if now >= deadline:
++                stop(process)
++                stage["timeout"] = True
++                break
++            if now >= next_report:
++                with (self.results / (stage["name"] + ".log")).open("rb") as log:
++                    log.seek(0, os.SEEK_END)
++                    log.seek(max(0, log.tell() - 8192))
++                    lines = log.read().decode(errors="replace").splitlines()
++                progress = [line for line in lines if "kv-multislot progress:" in line]
++                latest = (progress or lines or ["no log output yet"])[-1]
++                print("WAIT", stage["name"], "elapsed=%.1fmin" % ((time.time() - stage["started"])/60), latest[-500:], flush=True)
++                next_report = now + 60
++            try:
++                process.wait(timeout=min(5, max(0.01, deadline - now)))
++            except subprocess.TimeoutExpired:
++                pass
++        code = process.returncode
++        stage.update(exit_code=code, elapsed_seconds=round(time.time() - stage["started"], 3))
++        write_json(self.results / "stages.json", self.stages)
++        print("RESULT", stage["name"], code, flush=True)
++        if self.fault:
++            raise RuntimeError(self.fault)
++        if code not in accepted or stage.get("timeout"):
++            raise RuntimeError(stage["name"] + " failed; see its log")
++        return code
++
++    def run(self, name, command, timeout=1800, accepted=(0,)):
++        process, stage = self.start(name, command)
++        return self.finish(process, stage, timeout, accepted)
++
++    def close(self):
++        with self.lock:
++            running = list(self.processes)
++        for process in running:
++            stop(process)
++        self.done.set()
++        self.monitor.join(timeout=6)
++
++
++def http(base, endpoint, payload=None, timeout=900):
++    data = None if payload is None else json.dumps(payload).encode()
++    request = urllib.request.Request(base + endpoint, data=data,
++                                     headers={"Content-Type": "application/json"})
++    # Ignore proxy environment settings for the loopback-only test server.
++    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
++    with opener.open(request, timeout=timeout) as response:
++        content = response.read().decode()
++        return json.loads(content) if content.startswith(("{", "[")) else content
++
++
++def unused_port():
++    with socket.socket() as sock:
++        sock.bind(("127.0.0.1", 0))
++        return sock.getsockname()[1]
++
++
++def server_command(runner, binary, model, slots, port, unified=True, extra=()):
++    saves = runner.workspace / "slot-saves"
++    saves.mkdir(exist_ok=True)
++    return [binary, "--model", model, "--host", "127.0.0.1", "--port", str(port),
++            "--parallel", str(slots), "--ctx-size", "8192", "--batch-size", "512",
++            "--ubatch-size", str(runner.args.ubatch), "--n-gpu-layers", str(runner.args.gpu_layers),
++            "--flash-attn", "on", "--cache-type-k", "q5_1", "--cache-type-v", "q5_1",
++            "--kv-stream-arena-mib", str(runner.args.arena_mib),
++            "--kv-unified" if unified else "--no-kv-unified", "--fit", "off",
++            "--cache-ram", "0", "--ctx-checkpoints", "0", "--no-context-shift",
++            "--no-warmup", "--slots", "--metrics", "--verbosity", "4",
++            "--slot-save-path", str(saves) + "/", *extra]
++
++
++def launch_server(runner, name, command):
++    process, stage = runner.start(name, command)
++    port = command[command.index("--port") + 1]
++    base = "http://127.0.0.1:" + port
++    deadline = time.monotonic() + 900
++    while time.monotonic() < deadline:
++        if process.poll() is not None or runner.fault:
++            raise RuntimeError(name + " exited before becoming ready; see its log")
++        try:
++            if http(base, "/health", timeout=3).get("status") == "ok":
++                return process, stage, base
++        except (urllib.error.URLError, TimeoutError):
++            pass
++        time.sleep(1)
++    raise RuntimeError(name + " startup timed out")
++
++
++def complete(base, prompt, slot, count, cache=False):
++    result = http(base, "/completion", {"prompt": prompt, "id_slot": slot,
++                  "n_predict": count, "temperature": 0, "seed": 123,
++                  "ignore_eos": True, "cache_prompt": cache, "return_tokens": True})
++    if result.get("error") or result.get("id_slot") != slot or len(result.get("tokens", [])) != count:
++        raise RuntimeError("incomplete or incorrectly routed completion: " + json.dumps(result))
++    return result
++
++
++def server_tests(runner, binary, model):
++    for name, unified, extra, expected in (
++        ("reject_non_unified", False, [], "parallel sequences requires --kv-unified"),
++        ("reject_speculation", True, ["--spec-type", "ngram-simple"], "does not support speculative decoding"),
++    ):
++        command = server_command(runner, binary, model, 2, unused_port(), unified, extra)
++        process, stage = runner.start(name, command)
++        runner.finish(process, stage, 900, accepted=tuple(range(1, 256)))
++        if expected not in (runner.results / (name + ".log")).read_text(errors="replace"):
++            raise RuntimeError(name + " failed for an unexpected reason")
++
++    prompts = ["Amber notebook: describe stars and quiet weather. " * 70,
++               "Blue notebook: describe engines and loud machines. " * 53,
++               "Green notebook: describe rivers, maps and bridges. " * 61]
++    references = []
++    process, stage, base = launch_server(runner, "server_serial",
++        server_command(runner, binary, model, 1, unused_port()))
++    try:
++        for prompt, count in zip(prompts, (8, 48, 12)):
++            references.append(complete(base, prompt, 0, count))
++    finally:
++        stop(process)
++        runner.finish(process, stage, 15, accepted=(0, -signal.SIGTERM))
++
++    process, stage, base = launch_server(runner, "server_parallel",
++        server_command(runner, binary, model, 2, unused_port()))
++    data = {"references": references, "slot_samples": [], "comparisons_are_diagnostic": True}
++    try:
++        if len(http(base, "/slots")) != 2:
++            raise RuntimeError("server did not create two slots")
++        barrier = threading.Barrier(2)
++        def concurrent_completion(index):
++            barrier.wait(timeout=30)
++            return complete(base, prompts[index], index, (8, 48)[index])
++        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
++            first = executor.submit(concurrent_completion, 0)
++            second = executor.submit(concurrent_completion, 1)
++            overlap = False
++            while not first.done():
++                slots = http(base, "/slots", timeout=30)
++                data["slot_samples"].append({"time": time.time(), "slots": slots})
++                overlap |= sum(bool(slot.get("is_processing")) for slot in slots) == 2
++                time.sleep(0.1)
++            first_result = first.result()
++            # The long request must still be alive when the short slot is reused.
++            if second.done():
++                raise RuntimeError("arrival test missed overlap; increase the second request length")
++            replacement = executor.submit(complete, base, prompts[2], 0, 12)
++            results = [first_result, second.result(), replacement.result()]
++        if not overlap:
++            raise RuntimeError("never observed both slots processing")
++        data["results"] = results
++        data["exact_token_matches"] = [a["tokens"] == b["tokens"] for a, b in zip(references, results)]
++        # Numerical tolerance is checked by the C++ teacher-forced logit test.
++        # Greedy ties may change later HTTP tokens; record them for inspection.
++        data["save"] = http(base, "/slots/0?action=save", {"filename": "slot0.bin"})
++        data["erase"] = http(base, "/slots/0?action=erase", {})
++        data["restore"] = http(base, "/slots/0?action=restore", {"filename": "slot0.bin"})
++        if data["save"].get("n_written", 0) <= 0 or data["restore"].get("n_read", 0) <= 0:
++            raise RuntimeError("slot save/restore did not transfer state")
++        data["after_restore"] = complete(base, prompts[2], 0, 12, cache=True)
++        (runner.results / "server-metrics.txt").write_text(http(base, "/metrics"))
++    finally:
++        write_json(runner.results / "server-tests.json", data)
++        stop(process)
++        runner.finish(process, stage, 15, accepted=(0, -signal.SIGTERM))
++    log = (runner.results / "server_parallel.log").read_text(errors="replace")
++    data["arena_phases_logged"] = {phase: "activated " + phase + " phase" in log for phase in ("decode", "prefill")}
++    write_json(runner.results / "server-tests.json", data)
++    if not all(data["arena_phases_logged"].values()):
++        raise RuntimeError("server did not log both arena phases at verbosity 4")
++
++
++def prepare_source(runner, patch):
++    source = runner.workspace / "source"
++    if not runner.args.resume:
++        runner.run("git_init", ["git", "init", source])
++        runner.run("git_remote", ["git", "-C", source, "remote", "add", "origin", REPOSITORY])
++        runner.run("git_fetch", ["git", "-c", "credential.helper=", "-C", source,
++                                "fetch", "--depth", "1", "origin", BASE])
++        runner.run("git_checkout", ["git", "-C", source, "checkout", "--detach", BASE])
++        runner.run("patch_check", ["git", "-C", source, "apply", "--check", patch])
++        runner.run("patch_apply", ["git", "-C", source, "apply", patch])
++    else:
++        runner.run("resume_base", ["git", "-C", source, "rev-parse", "HEAD"])
++        if (runner.results / "resume_base.log").read_text().strip() != BASE:
++            raise RuntimeError("resume checkout is not at the required base commit")
++        current = runner.run("resume_current_patch", ["git", "-C", source,
++                             "apply", "--reverse", "--check", patch], accepted=(0, 1)) == 0
++        if not current:
++            previous = runner.workspace / "applied-kv-stream.patch"
++            if not previous.is_file():
++                previous = runner.workspace / "results" / "kv-stream-multislot.patch"
++            if not previous.is_file():
++                raise RuntimeError("resume workspace is missing its previously applied patch")
++            saved_previous = runner.results / "previous-kv-stream.patch"
++            shutil.copyfile(previous, saved_previous)
++            runner.run("resume_previous_patch", ["git", "-C", source,
++                       "apply", "--reverse", "--check", saved_previous])
++            timestamps = {}
++            for patch_file in (saved_previous, patch):
++                for line in patch_file.read_text().splitlines():
++                    if not line.startswith(("--- a/", "+++ b/")):
++                        continue
++                    relative = Path(line[6:])
++                    if relative.is_absolute() or ".." in relative.parts:
++                        raise RuntimeError("unsafe patch path")
++                    path = source / relative
++                    if path.is_file() and not path.is_symlink() and path not in timestamps:
++                        stat = path.stat()
++                        timestamps[path] = (hashlib.sha256(path.read_bytes()).digest(), stat)
++            try:
++                runner.run("resume_remove_previous", ["git", "-C", source,
++                           "apply", "--reverse", saved_previous])
++                try:
++                    runner.run("patch_check", ["git", "-C", source, "apply", "--check", patch])
++                    runner.run("patch_apply", ["git", "-C", source, "apply", patch])
++                except BaseException:
++                    runner.run("resume_restore_previous", ["git", "-C", source, "apply", saved_previous])
++                    raise
++            finally:
++                restored = []
++                changed = []
++                for path, (digest, stat) in timestamps.items():
++                    if (path.is_file() and not path.is_symlink() and path.stat().st_mode == stat.st_mode and
++                            hashlib.sha256(path.read_bytes()).digest() == digest):
++                        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
++                        if path.stat().st_mtime_ns != stat.st_mtime_ns:
++                            raise RuntimeError("could not restore unchanged source timestamp")
++                        restored.append(str(path.relative_to(source)))
++                    else:
++                        changed.append(str(path.relative_to(source)))
++                write_json(runner.results / "resume-timestamps.json", {
++                    "content_identical_timestamps_restored": restored, "changed_files": changed})
++                print("RESUME unchanged timestamps restored=" + str(len(restored)), flush=True)
++    installed_patch = runner.workspace / "applied-kv-stream.patch"
++    if patch.resolve() != installed_patch.resolve():
++        shutil.copyfile(patch, installed_patch)
++    runner.run("diff_check", ["git", "-C", source, "diff", "--check"])
++    return source
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--model", required=True, type=Path, help="existing GGUF; linked read-only, never copied")
++    parser.add_argument("--patch", type=Path, default=Path(__file__).resolve().with_name("kv-stream-multislot.patch"))
++    parser.add_argument("--resume", type=Path, help="reuse a previous runner workspace under /mnt/ramdisk and its compiled objects")
++    parser.add_argument("--arena-mib", type=int, default=2048, help="use your working single-slot arena size")
++    parser.add_argument("--pressure-arena-mib", type=int, default=128, help="smaller arena for the 3K-per-slot streaming-pressure check")
++    parser.add_argument("--cuda-arch", default="89", help="89 for RTX 4080")
++    parser.add_argument("--gpu-layers", type=int, default=999)
++    parser.add_argument("--ubatch", type=int, default=128)
++    parser.add_argument("--jobs", type=int, default=2)
++    parser.add_argument("--long-prompt", type=int, default=250000)
++    parser.add_argument("--skip-long", action="store_true", help="quick run; report marks long validation skipped")
++    parser.add_argument("--long-on-failure", action="store_true", help="run the expensive long-context diagnostic even if prerequisite runtime checks fail")
++    parser.add_argument("--model-timeout-hours", type=float, default=24)
++    parser.add_argument("--max-abs", type=float, default=0.15)
++    parser.add_argument("--max-rmse", type=float, default=0.02)
++    args = parser.parse_args()
++    model = args.model.expanduser().resolve(strict=True)
++    patch = args.patch.expanduser().resolve(strict=True)
++    if not ROOT.is_dir() or not os.path.ismount(ROOT):
++        parser.error("/mnt/ramdisk must be an existing mounted ramdisk; no fallback path is used")
++    if not model.is_file() or not patch.is_file():
++        parser.error("model and patch must be files")
++    if args.arena_mib <= 0 or args.pressure_arena_mib <= 0 or not 1 <= args.jobs <= 4 or not 2 <= args.ubatch <= 512 or not 512 <= args.long_prompt <= 1000000:
++        parser.error("invalid arena, jobs (1..4), ubatch (2..512), or long prompt length")
++    if args.model_timeout_hours <= 0 or not args.max_abs > 0 or not args.max_rmse > 0:
++        parser.error("timeouts and comparison tolerances must be positive")
++    if args.resume:
++        workspace = args.resume.expanduser().resolve(strict=True)
++        if workspace == ROOT.resolve() or not workspace.is_relative_to(ROOT.resolve()):
++            parser.error("--resume must point to a runner workspace inside /mnt/ramdisk")
++        if not (workspace / "source" / ".git").is_dir() or not (workspace / "build" / "CMakeCache.txt").is_file():
++            parser.error("--resume requires an existing source checkout and CMake build directory")
++        if any(not (workspace / name).resolve().is_relative_to(workspace) for name in ("source", "build")):
++            parser.error("resume source and build directories must remain inside the ramdisk workspace")
++    else:
++        workspace = ROOT / ("kv-multislot-" + time.strftime("%Y%m%d-%H%M%S") + "-" + str(os.getpid()))
++        workspace.mkdir()
++    runner = Runner(workspace, args)
++    status = "FAIL"
++    error = None
++    failed_checks = []
++    long_attempted = False
++    try:
++        shutil.copyfile(patch, runner.results / "kv-stream-multislot.patch")
++        shutil.copyfile(Path(__file__).resolve(), runner.results / "run_kv_multislot_tests.py")
++        write_json(runner.results / "manifest.json", {
++            "repository": REPOSITORY, "base": BASE, "model_name": model.name,
++            "model_bytes": model.stat().st_size, "patch_sha256": hashlib.sha256(patch.read_bytes()).hexdigest(),
++            "settings": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
++            "long_validation_skipped": args.skip_long,
++        })
++        for tool in ("git", "cmake", "ctest", "nvcc", "nvidia-smi"):
++            if shutil.which(tool) is None:
++                raise RuntimeError("required tool not found: " + tool)
++        runner.run("environment", ["nvidia-smi", "-q"], timeout=30)
++        runner.run("compiler", ["nvcc", "--version"], timeout=30)
++        runner.run("python_syntax", [sys.executable, "-m", "py_compile", runner.results / "run_kv_multislot_tests.py"])
++        source = prepare_source(runner, patch)
++        model_dir = workspace / "model"
++        model_dir.mkdir(exist_ok=bool(args.resume))
++        # Link all shards when the selected model is a split GGUF.
++        split = re.fullmatch(r"(.*)-\d{5}-of-(\d{5})\.gguf", model.name)
++        shards = sorted(model.parent.glob(split[1] + "-?????-of-" + split[2] + ".gguf")) if split else [model]
++        if split and len(shards) != int(split[2]):
++            raise RuntimeError("not all GGUF shards are present beside the selected model")
++        for shard in shards:
++            link = model_dir / shard.name
++            if link.is_symlink() and link.resolve() == shard.resolve():
++                continue
++            if link.exists() or link.is_symlink():
++                raise RuntimeError("existing model link points to a different input: " + str(link))
++            link.symlink_to(shard)
++        linked_model = model_dir / model.name
++        build = workspace / "build"
++        runner.run("configure", ["cmake", "-S", source, "-B", build,
++                   "-DCMAKE_BUILD_TYPE=Release", "-DGGML_CUDA=ON", "-DGGML_CUDA_FA_ALL_QUANTS=ON",
++                   "-DCMAKE_CUDA_ARCHITECTURES=" + args.cuda_arch, "-DLLAMA_BUILD_TESTS=ON",
++                   "-DLLAMA_BUILD_TOOLS=ON", "-DLLAMA_BUILD_SERVER=ON", "-DLLAMA_BUILD_EXAMPLES=OFF",
++                   "-DLLAMA_OPENSSL=OFF", "-DGGML_CCACHE=OFF"], timeout=1800)
++        runner.run("build", ["cmake", "--build", build, "--parallel", str(args.jobs),
++                   "--target", "llama-server", "test-kv-stream-multislot", *TESTS], timeout=14400)
++        expression = "^(" + "|".join(TESTS) + ")$"
++        runner.run("ctest_inventory", ["ctest", "--test-dir", build, "--show-only=json-v1", "-R", expression])
++        inventory = json.loads((runner.results / "ctest_inventory.log").read_text())
++        if set(item["name"] for item in inventory["tests"]) != set(TESTS):
++            raise RuntimeError("required CTest targets are missing")
++        def independent_check(name, function):
++            try:
++                function()
++            except Exception as failure:
++                failed_checks.append({"name": name, "error": str(failure)})
++                (runner.results / (name + "-failure.txt")).write_text(traceback.format_exc())
++                print("CHECK FAILED:", name, str(failure), flush=True)
++                if runner.fault:
++                    raise
++        independent_check("ctest", lambda: runner.run("ctest", ["ctest", "--test-dir", build,
++                   "--output-on-failure", "--verbose", "-j", "1", "--timeout", "1800", "--output-junit",
++                   runner.results / "ctest.xml", "-R", expression], timeout=14400))
++        binary = build / "bin" / "test-kv-stream-multislot"
++        model_command = [binary, "--model", linked_model, "--arena-mib", str(args.arena_mib),
++                         "--gpu-layers", str(args.gpu_layers), "--ubatch", str(args.ubatch),
++                         "--max-abs", str(args.max_abs), "--max-rmse", str(args.max_rmse)]
++        def model_reference_proof(name, report, minimum_kv=0):
++            log = (runner.results / (name + ".log")).read_text(errors="replace")
++            calls = [tuple(map(int, pair)) for pair in re.findall(
++                r"kv_stream_fp32_reference: queries=(\d+) kv=(\d+)", log)]
++            recorded = {}
++            replayed = {}
++            for line in log.splitlines():
++                for label, collection in (("kv_stream_plan_record:", recorded), ("kv_stream_plan_replay:", replayed)):
++                    if label in line:
++                        fields = dict(re.findall(r"(\w+)=([^\s]+)", line))
++                        fields["file"] = line.split(" file=", 1)[1]
++                        collection.setdefault(fields["file"], []).append(fields)
++            plans = []
++            for suffix in (".serial-0.plan", ".serial-1.plan", ".serial-2.plan", ".parallel.plan"):
++                path = Path(str(report) + suffix)
++                records = recorded.get(str(path), [])
++                replays = replayed.get(str(path), [])
++                lines = path.read_text().splitlines() if path.is_file() else []
++                complete = bool(lines) and len(lines) == len(records) == len(replays)
++                split_mma = split_vec = 0
++                for index, line in enumerate(lines):
++                    values = list(map(int, line.split()))
++                    if len(values) < 6:
++                        complete = False
++                        continue
++                    version, shape, mode, parts, queries, spans = values[:6]
++                    complete &= (version == 1 and 0 <= shape < 2**64 and mode in range(4) and
++                                 parts > 0 and queries > 0 and spans > 0 and len(values) == 6 + 2*spans)
++                    split_mma += mode == 2 and spans > 1
++                    split_vec += mode == 3 and spans > 1
++                    if index >= len(records) or index >= len(replays):
++                        complete = False
++                        continue
++                    a, b = records[index], replays[index]
++                    complete &= (all(a[key] == b[key] for key in ("queries", "kv", "mode", "spans")) and
++                                 int(b["call"]) == index + 1 and int(a["mode"]) == mode and int(a["spans"]) == spans)
++                    next_token = 0
++                    for begin, count in zip(values[6::2], values[7::2]):
++                        complete &= begin == next_token and count > 0 and count % 256 == 0
++                        next_token += count
++                    complete &= next_token == int(a["kv"])
++                plans.append({"file": path.name, "records": len(records), "replays": len(replays),
++                              "complete": complete, "split_mma_calls": split_mma, "split_vector_calls": split_vec})
++            with report.open() as source_report:
++                rows = list(csv.DictReader(source_report))
++            required = [row for row in rows if row["required"] == "1"]
++            proof = {"gpu_resident_fp32_attention_calls": len(calls),
++                     "maximum_kv_tokens": max((int(row["kv"]) for entries in replayed.values() for row in entries), default=0),
++                     "required_comparisons": len(required),
++                     "required_comparisons_use_partition_baseline": len(required) == 64 and all(
++                         row["case"].startswith("partition_resident_") for row in required),
++                     "plans": plans,
++                     "single_span_fp32_diagnostic_comparisons": sum(row["case"].startswith("fp32_resident_vs_") for row in rows),
++                     "stock_diagnostic_comparisons": sum(row["case"].startswith("stock_resident_") for row in rows)}
++            write_json(runner.results / (name.replace("_", "-") + "-reference-proof.json"), proof)
++            if (not calls or proof["maximum_kv_tokens"] < minimum_kv or
++                    not proof["required_comparisons_use_partition_baseline"] or not all(plan["complete"] for plan in plans) or
++                    proof["stock_diagnostic_comparisons"] != 39 or proof["single_span_fp32_diagnostic_comparisons"] != 39 or
++                    set(recorded) != set(replayed) or len(recorded) != 4 or
++                    (minimum_kv and (not any(plan["split_mma_calls"] for plan in plans) or not plans[-1]["split_vector_calls"]))):
++                raise RuntimeError("model check lacks complete resident partition replay or retained diagnostics; see reference proof")
++        def model_short():
++            report = runner.results / "model-short.csv"
++            try:
++                runner.run("model_short", [*model_command, "--prompt-tokens", "1023", "--report", report],
++                           timeout=args.model_timeout_hours*3600)
++            finally:
++                model_reference_proof("model_short", report)
++        independent_check("model_short", model_short)
++        def model_pressure(name="model_pressure", diagnostic=False):
++            stem = name.replace("_", "-")
++            previous_check = runner.env.get("GGML_CUDA_KV_STREAM_CHECK_ATTENTION")
++            if diagnostic:
++                runner.env["GGML_CUDA_KV_STREAM_CHECK_ATTENTION"] = "1"
++            else:
++                runner.env.pop("GGML_CUDA_KV_STREAM_CHECK_ATTENTION", None)
++            try:
++                runner.run(name, [*model_command, "--arena-mib", str(args.pressure_arena_mib),
++                           "--prompt-tokens", "3071", "--second-prompt-tokens", "2814",
++                           "--report", runner.results / (stem + ".csv")],
++                           timeout=args.model_timeout_hours*3600, accepted=(0, 1) if diagnostic and any(
++                               check["name"] == "model_pressure" for check in failed_checks) else (0,))
++            finally:
++                if previous_check is None:
++                    runner.env.pop("GGML_CUDA_KV_STREAM_CHECK_ATTENTION", None)
++                else:
++                    runner.env["GGML_CUDA_KV_STREAM_CHECK_ATTENTION"] = previous_check
++                log = (runner.results / (name + ".log")).read_text(errors="replace")
++                samples = [tuple(map(int, match)) for match in re.findall(
++                    r"kv_stream_adapt: queries (\d+), active (\d+), resident (\d+), ring (\d+)", log)]
++                pressure = any(queries == 2 and (active + 255)//256 > resident for queries, active, resident, _ in samples)
++                write_json(runner.results / (stem + "-proof.json"), {
++                    "arena_mib": args.pressure_arena_mib, "two_query_nonresident_working_set": pressure,
++                    "trace_samples": len(samples)})
++                checks = []
++                pairs = []
++                partitions = []
++                oracles = []
++                oracle_skips = []
++                for line in log.splitlines():
++                    if "kv_stream_attention_check:" in line:
++                        checks.append(dict(re.findall(r"(\w+)=([^\s]+)", line)))
++                    elif "kv_stream_fp32_pair:" in line:
++                        pair = dict(re.findall(r"(\w+)=([^\s]+)", line))
++                        pair["attention_check_index"] = len(checks) - 1
++                        pairs.append(pair)
++                    elif "kv_stream_partition_check:" in line:
++                        partition = dict(re.findall(r"(\w+)=([^\s]+)", line))
++                        partition["attention_check_index"] = len(checks) - 1
++                        partitions.append(partition)
++                    elif "kv_stream_attention_oracle:" in line:
++                        oracle = dict(re.findall(r"(\w+)=([^\s]+)", line))
++                        oracle["attention_check_index"] = len(checks) - 1
++                        oracles.append(oracle)
++                    elif "kv_stream_attention_oracle_skip:" in line:
++                        oracle_skips.append(dict(re.findall(r"(\w+)=([^\s]+)", line)))
++                if diagnostic:
++                    write_json(runner.results / (stem + "-attention-checks.json"), checks)
++                    write_json(runner.results / (stem + "-attention-oracles.json"), {
++                        "samples": oracles, "skipped": oracle_skips})
++                    write_json(runner.results / (stem + "-fp32-pairs.json"), pairs)
++                    write_json(runner.results / (stem + "-partition-checks.json"), partitions)
++                    for check in checks:
++                        print("ATTENTION CHECK", json.dumps(check), flush=True)
++                    for oracle in oracles:
++                        if oracle.get("worst_row") == "1":
++                            print("ATTENTION ORACLE", json.dumps(oracle), flush=True)
++                    for pair in pairs:
++                        print("FP32 PAIR", json.dumps(pair), flush=True)
++                    for partition in partitions:
++                        print("PARTITION CHECK", json.dumps(partition), flush=True)
++                model_reference_proof(name, runner.results / (stem + ".csv"), 3072)
++            if not pressure:
++                raise RuntimeError("pressure check did not exercise two-query generation beyond resident capacity; lower --pressure-arena-mib")
++            if diagnostic and (not checks or "multislot result:" not in log):
++                raise RuntimeError("attention diagnostic did not finish or capture streamed attention")
++            if diagnostic:
++                byte_fields = ("k_bad", "v_bad", "k_bad_visible", "v_bad_visible", "stream_k_bad", "stream_v_bad",
++                               "stream_k_bad_visible", "stream_v_bad_visible")
++                if (any(check.get("finite") != "1" or any(check.get(key) != "0" for key in byte_fields) for check in checks) or
++                        not any(check.get("stream_checked") == "1" for check in checks)):
++                    raise RuntimeError("attention diagnostic found non-finite output, unequal cache bytes or no safe streamed-page check")
++                if ({row["attention_check_index"] for row in partitions} != set(range(len(checks))) or
++                        len(partitions) != len(checks) or any(row.get("finite") != "1" or
++                            not 0 <= float(row["max_abs"]) <= 0.0005 or not 0 <= float(row["rmse"]) <= 0.0005 for row in partitions)):
++                    raise RuntimeError("full-tensor resident partition reference exceeds the CUDA-attention tolerance or lacks coverage")
++                prefill_checks = [check for check in checks if check.get("kernel") == "400" and int(check["queries"]) > 2]
++                layers = int(prefill_checks[0]["layers"]) if prefill_checks else 0
++                expected_layers = {0, layers//2, layers - 1} if layers else set()
++                captured_layers = {int(check["layer"]) for check in prefill_checks}
++                if not expected_layers or not expected_layers.issubset(captured_layers):
++                    raise RuntimeError("attention diagnostic did not capture first, middle and final prefill layers")
++                for index, check in enumerate(checks):
++                    if check.get("kernel") != "400" or int(check["queries"]) <= 2:
++                        continue
++                    captured = [sample for sample in oracles if sample["attention_check_index"] == index]
++                    pair_rows = [pair for pair in pairs if pair["attention_check_index"] == index]
++                    if (len(pair_rows) != 1 or any(not 0 <= float(pair_rows[0][key]) < float("inf") for key in ("max_abs", "rmse"))):
++                        raise RuntimeError("attention diagnostic lacks a finite full-tensor FP32 partition comparison")
++                    if (not captured or any(sample.get("finite") != "1" for sample in captured) or
++                            {sample.get("mode") for sample in captured if sample.get("worst_row") == "1"} !=
++                            {"f16_inputs", "quantized_inputs"}):
++                        raise RuntimeError("attention diagnostic lacks finite double-precision samples for an MMA check; see its log")
++                layer0 = [sample for sample in oracles if sample.get("layer") == "0" and sample.get("mode") == "f16_inputs"]
++                if not layer0 or any(not float(sample[key]) <= 0.0005 for sample in layer0
++                                       for key in ("streamed_max_abs", "resident_fp32_max_abs")):
++                    raise RuntimeError("first-layer streamed or resident FP32 attention exceeds the independent CUDA-attention threshold")
++        independent_check("model_pressure", model_pressure)
++        def attention_oracle_validation():
++            name = "attention_oracle_validation"
++            previous_check = runner.env.get("GGML_CUDA_KV_STREAM_CHECK_ATTENTION")
++            runner.env["GGML_CUDA_KV_STREAM_CHECK_ATTENTION"] = "1"
++            try:
++                runner.run(name, [build / "bin" / "test-kv-stream-cuda-attn",
++                           "Q5_1 prefill preserves constant values across long resident spans"], timeout=1800)
++            finally:
++                if previous_check is None:
++                    runner.env.pop("GGML_CUDA_KV_STREAM_CHECK_ATTENTION", None)
++                else:
++                    runner.env["GGML_CUDA_KV_STREAM_CHECK_ATTENTION"] = previous_check
++                log = (runner.results / (name + ".log")).read_text(errors="replace")
++                samples = [dict(re.findall(r"(\w+)=([^\s]+)", line)) for line in log.splitlines()
++                           if "kv_stream_attention_oracle:" in line]
++                write_json(runner.results / "attention-oracle-validation.json", samples)
++            f16_samples = [sample for sample in samples if sample.get("mode") == "f16_inputs" and
++                           sample.get("queries") == "127" and sample.get("kv") == "3072"]
++            if (not f16_samples or any(sample.get("finite") != "1" for sample in samples) or
++                    any(not float(sample[key]) <= 0.0005 for sample in f16_samples
++                        for key in ("streamed_max_abs", "resident_fp32_max_abs"))):
++                raise RuntimeError("double-precision oracle did not reproduce the known-answer Q5_1 test; see its log")
++            print("ORACLE VALIDATION sampled_max_abs=" + str(max(
++                float(sample["streamed_max_abs"]) for sample in f16_samples)), flush=True)
++        independent_check("attention_oracle_validation", attention_oracle_validation)
++        independent_check("model_attention_diagnostic", lambda: model_pressure("model_attention_diagnostic", True))
++        independent_check("server", lambda: server_tests(runner, build / "bin" / "llama-server", linked_model))
++        if not args.skip_long and (not failed_checks or args.long_on_failure):
++            long_attempted = True
++            independent_check("model_long", lambda: runner.run("model_long", [*model_command, "--prompt-tokens", str(args.long_prompt),
++                       "--second-prompt-tokens", str(args.long_prompt), "--report", runner.results / "model-long.csv"],
++                       timeout=args.model_timeout_hours*3600))
++        elif not args.skip_long:
++            print("SKIP model_long: prerequisite runtime checks failed; inspect their logs first", flush=True)
++        if failed_checks:
++            raise RuntimeError("failed checks: " + ", ".join(item["name"] for item in failed_checks))
++        status = "PASS_SHORT_ONLY" if args.skip_long else "PASS"
++    except BaseException as failure:
++        error = str(failure) or type(failure).__name__
++        (runner.results / "failure.txt").write_text(traceback.format_exc())
++        print("FAILED:", error, flush=True)
++    finally:
++        runner.close()
++        write_json(runner.results / "summary.json", {"status": status, "error": error,
++                   "base": BASE, "long_prompt_tokens_per_slot": args.long_prompt,
++                   "long_validation_skipped": not long_attempted, "peak_workspace_bytes": runner.peak_workspace_bytes,
++                   "workspace_limit_bytes": 24*GIB, "resource_guard_error": runner.fault,
++                   "failed_checks": failed_checks,
++                   "comparison_thresholds": {"max_abs": args.max_abs, "rmse": args.max_rmse}})
++        archive = workspace / (runner.results.name + ".tar.gz")
++        with tarfile.open(archive, "w:gz") as bundle:
++            bundle.add(runner.results, arcname="results")
++        print("\n" + status + "\nAttach this file to the conversation:\n" + str(archive), flush=True)
++    return 0 if status.startswith("PASS") else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index ef6c34e..18034e8 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -396,7 +396,8 @@ llama_context::llama_context(
+             /*.minimum_arena_bytes =*/ kv_stream_arena_bytes == 0 ? uint64_t(0) : uint64_t(1),
+             /*.arch_qwen35         =*/ model.arch == LLM_ARCH_QWEN35,
+             /*.context_default     =*/ cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT,
+-            /*.single_sequence     =*/ cparams.n_seq_max == 1,
++            /*.n_seq_max           =*/ cparams.n_seq_max,
++            /*.kv_unified          =*/ cparams.kv_unified,
+             /*.flash_attention     =*/ cparams.flash_attn,
+             /*.kv_offload          =*/ cparams.offload_kqv,
+         };
+@@ -840,17 +841,21 @@ bool llama_context::kv_stream_switch_phase(
+     }
+ 
+     const uint32_t n_seqs = cparams.n_seq_max;
+-    const uint32_t n_tokens = decode ?
+-        n_seqs : std::min(cparams.n_ctx, cparams.n_ubatch);
+-    const uint32_t n_outputs = decode ?
+-        n_seqs : std::min(n_tokens, cparams.n_outputs_max);
+-    auto * gf = graph_reserve(
+-        n_tokens, n_seqs, n_outputs, reserve_mctx.get());
+-    if (gf == nullptr) {
+-        LLAMA_LOG_ERROR(
+-            "%s: failed to reserve %s compute graph in phase arena\n",
+-            __func__, decode ? "decode" : "prefill");
+-        return false;
++    for (uint32_t active = 1; active <= n_seqs; ++active) {
++        const uint32_t n_tokens = decode ?
++            active : std::min(cparams.n_ctx, cparams.n_ubatch);
++        const uint32_t n_outputs = decode ?
++            active : std::min<uint64_t>(
++                std::min(n_tokens, cparams.n_outputs_max),
++                uint64_t(active)*cparams.n_outputs_max_per_seq);
++        auto * gf = graph_reserve(
++            n_tokens, active, n_outputs, reserve_mctx.get());
++        if (gf == nullptr) {
++            LLAMA_LOG_ERROR(
++                "%s: failed to reserve %s compute graph in phase arena\n",
++                __func__, decode ? "decode" : "prefill");
++            return false;
++        }
+     }
+ 
+     backend_buf_exp_size = target.backend_sizes;
+@@ -933,21 +938,40 @@ void llama_context::sched_reserve() {
+         std::vector<size_t> sizes_pp(backend_ptrs.size(), 0);
+         std::vector<size_t> sizes_tg(backend_ptrs.size(), 0);
+ 
+-        auto * gf_pp = graph_reserve(
+-            n_tokens, n_seqs, n_outputs_pp, mctx.get(), true, sizes_pp.data());
+-        if (gf_pp == nullptr) {
+-            throw std::runtime_error("failed to measure compute pp buffers");
+-        }
+-        const int n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
+-        const int n_nodes_pp = ggml_graph_n_nodes(gf_pp);
++        int n_splits_pp = 0;
++        int n_nodes_pp  = 0;
++        int n_splits_tg = 0;
++        int n_nodes_tg  = 0;
++
++        // Partial batches may need additional recurrent-state copies.
++        // Reserve the largest workspace across active sequence counts in each phase.
++        for (uint32_t active = 1; active <= n_seqs; ++active) {
++            std::vector<size_t> measured(backend_ptrs.size(), 0);
++            const uint32_t active_outputs = std::min<uint64_t>(
++                n_outputs_pp, uint64_t(active)*cparams.n_outputs_max_per_seq);
++            auto * gf = graph_reserve(
++                n_tokens, active, active_outputs, mctx.get(), true, measured.data());
++            if (gf == nullptr) {
++                throw std::runtime_error("failed to measure compute pp buffers");
++            }
++            n_splits_pp = std::max(n_splits_pp, ggml_backend_sched_get_n_splits(sched.get()));
++            n_nodes_pp  = std::max(n_nodes_pp, ggml_graph_n_nodes(gf));
++            for (size_t i = 0; i < measured.size(); ++i) {
++                sizes_pp[i] = std::max(sizes_pp[i], measured[i]);
++            }
+ 
+-        auto * gf_tg = graph_reserve(
+-            n_seqs, n_seqs, n_seqs, mctx.get(), true, sizes_tg.data());
+-        if (gf_tg == nullptr) {
+-            throw std::runtime_error("failed to measure compute tg buffers");
++            std::fill(measured.begin(), measured.end(), 0);
++            gf = graph_reserve(
++                active, active, active, mctx.get(), true, measured.data());
++            if (gf == nullptr) {
++                throw std::runtime_error("failed to measure compute tg buffers");
++            }
++            n_splits_tg = std::max(n_splits_tg, ggml_backend_sched_get_n_splits(sched.get()));
++            n_nodes_tg  = std::max(n_nodes_tg, ggml_graph_n_nodes(gf));
++            for (size_t i = 0; i < measured.size(); ++i) {
++                sizes_tg[i] = std::max(sizes_tg[i], measured[i]);
++            }
+         }
+-        const int n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
+-        const int n_nodes_tg = ggml_graph_n_nodes(gf_tg);
+ 
+         const uint64_t compute_alignment =
+             ggml_backend_buft_get_alignment(backend_buft[backend_index]);
+@@ -1792,10 +1816,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+                 const bool generation =
+                     llama_kv_stream_phase_is_generation(
+                         phase, ubatch.n_tokens);
+-                if (kv_stream_phase_arena.configured && generation &&
+-                        ubatch.n_tokens != cparams.n_seq_max) {
++                bool generation_supported = llama_kv_stream_generation_batch_supported(
++                    ubatch.n_tokens, ubatch.n_seqs_unq,
++                    ubatch.n_seq_tokens, cparams.n_seq_max);
++                for (uint32_t i = 0; generation_supported && i < ubatch.n_tokens; ++i) {
++                    generation_supported = ubatch.n_seq_id[i] == 1;
++                }
++                if (kv_stream_phase_arena.configured && generation && !generation_supported) {
+                     LLAMA_LOG_ERROR(
+-                        "%s: phase arena currently supports TG1 without speculative batches\n",
++                        "%s: phase arena generation requires one token per active sequence without speculative batches\n",
+                         __func__);
+                     ret = GGML_STATUS_FAILED;
+                     return nullptr;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 7c1f2d4..2916941 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1415,8 +1415,8 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
+     owner.previous_deadline_samples = deadline_samples;
+     owner.previous_deadline_misses = deadline_misses;
+     if (getenv("LLAMA_KV_STREAM_TRACE") != nullptr) {
+-        LLAMA_LOG_WARN("%s: active %u, resident %u, ring %u, samples %llu, misses %llu, copy busy %.1f%%, peak %u\n",
+-            __func__, active_tokens, resident_pages, ring_slots,
++        LLAMA_LOG_WARN("%s: queries %u, active %u, resident %u, ring %u, samples %llu, misses %llu, copy busy %.1f%%, peak %u\n",
++            __func__, query_tokens, active_tokens, resident_pages, ring_slots,
+             (unsigned long long) delta.deadline_samples,
+             (unsigned long long) delta.deadline_misses,
+             100.0*copy_busy_ratio, peak_occupancy);
+diff --git a/src/llama-kv-stream-config.cpp b/src/llama-kv-stream-config.cpp
+index c4ab757..e4de73b 100644
+--- a/src/llama-kv-stream-config.cpp
++++ b/src/llama-kv-stream-config.cpp
+@@ -17,8 +17,11 @@ llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_str
+     if (!config.context_default) {
+         return invalid("block KV streaming currently supports only the target context, not MTP/draft contexts");
+     }
+-    if (!config.single_sequence) {
+-        return invalid("block KV streaming requires exactly one sequence (-np 1)");
++    if (config.n_seq_max == 0) {
++        return invalid("block KV streaming requires at least one sequence");
++    }
++    if (config.n_seq_max > 1 && !config.kv_unified) {
++        return invalid("block KV streaming with parallel sequences requires --kv-unified");
+     }
+     if (!config.flash_attention) {
+         return invalid("block KV streaming requires Flash Attention");
+@@ -33,6 +36,13 @@ llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_str
+     return { true, true, {} };
+ }
+ 
++bool llama_kv_stream_generation_batch_supported(
++        uint32_t batch_tokens, uint32_t unique_sequences,
++        uint32_t tokens_per_sequence, uint32_t max_sequences) {
++    return batch_tokens > 0 && batch_tokens <= max_sequences &&
++        unique_sequences == batch_tokens && tokens_per_sequence == 1;
++}
++
+ llama_kv_stream_pool_layout llama_kv_stream_pool_layout_make(
+         const llama_kv_stream_pool_layout_params & params) {
+     llama_kv_stream_pool_layout result;
+diff --git a/src/llama-kv-stream-config.h b/src/llama-kv-stream-config.h
+index f844b74..e967a9f 100644
+--- a/src/llama-kv-stream-config.h
++++ b/src/llama-kv-stream-config.h
+@@ -9,7 +9,8 @@ struct llama_kv_stream_config {
+ 
+     bool arch_qwen35     = false;
+     bool context_default = false;
+-    bool single_sequence = false;
++    uint32_t n_seq_max   = 1;
++    bool kv_unified      = false;
+     bool flash_attention = false;
+     bool kv_offload      = false;
+ };
+@@ -81,3 +82,7 @@ enum llama_kv_stream_phase {
+ 
+ bool llama_kv_stream_phase_is_generation(
+     llama_kv_stream_phase phase, uint32_t batch_tokens);
++
++bool llama_kv_stream_generation_batch_supported(
++    uint32_t batch_tokens, uint32_t unique_sequences,
++    uint32_t tokens_per_sequence, uint32_t max_sequences);
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index dfdf0b1..e25ce64 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -303,6 +303,8 @@ if (GGML_CUDA)
+     llama_build_and_test(test-kv-stream-cuda-buffer.cpp LABEL cuda)
+     llama_build_and_test(test-kv-stream-cuda-attn.cpp LABEL cuda)
+     llama_build_and_test(test-kv-stream-cuda-set-rows.cpp LABEL cuda)
++    # Invoked by the ramdisk runner with the user's GGUF, not by model-free CTest.
++    llama_build(test-kv-stream-multislot.cpp)
+ endif()
+ llama_build_and_test(test-model-resolution.cpp)
+ # the test serves its repos from an httplib server, and the library links it privately
+diff --git a/tests/test-kv-stream-config.cpp b/tests/test-kv-stream-config.cpp
+index 4553357..d05a5d9 100644
+--- a/tests/test-kv-stream-config.cpp
++++ b/tests/test-kv-stream-config.cpp
+@@ -1,6 +1,8 @@
+ #include "llama-kv-stream-config.h"
+ #include "testing.h"
+ 
++#include <initializer_list>
++
+ int main() {
+     testing t;
+ 
+@@ -17,7 +19,6 @@ int main() {
+         config.minimum_arena_bytes = 1664ULL*256ULL;
+         config.arch_qwen35        = true;
+         config.context_default    = true;
+-        config.single_sequence    = true;
+         config.flash_attention    = true;
+         config.kv_offload         = true;
+ 
+@@ -32,7 +33,6 @@ int main() {
+         base.minimum_arena_bytes = 1664ULL*256ULL;
+         base.arch_qwen35         = true;
+         base.context_default     = true;
+-        base.single_sequence     = true;
+         base.flash_attention     = true;
+         base.kv_offload          = true;
+ 
+@@ -48,8 +48,11 @@ int main() {
+         config.context_default = false;
+         expect_invalid("draft/MTP context", config);
+         config = base;
+-        config.single_sequence = false;
+-        expect_invalid("parallel sequences", config);
++        config.n_seq_max = 2;
++        expect_invalid("parallel sequences without unified KV", config);
++        config = base;
++        config.n_seq_max = 0;
++        expect_invalid("zero sequences", config);
+         config = base;
+         config.flash_attention = false;
+         expect_invalid("Flash Attention disabled", config);
+@@ -60,6 +63,31 @@ int main() {
+         expect_invalid("arena below its minimum", config);
+     });
+ 
++    t.test("parallel streaming uses a unified cache", [](testing & t) {
++        llama_kv_stream_config config;
++        config.arena_bytes = 64ULL*1024ULL*1024ULL;
++        config.minimum_arena_bytes = 1;
++        config.arch_qwen35 = config.context_default = true;
++        config.flash_attention = config.kv_offload = true;
++        config.kv_unified = true;
++        for (uint32_t slots : { 1U, 2U, 4U }) {
++            config.n_seq_max = slots;
++            const auto result = llama_kv_stream_config_validate(config);
++            t.assert_true("unified sequence count accepted", result.valid && result.enabled);
++        }
++    });
++
++    t.test("generation allows inactive slots but rejects speculative shapes", [](testing & t) {
++        t.assert_true("serial generation", llama_kv_stream_generation_batch_supported(1, 1, 1, 1));
++        t.assert_true("one of two slots", llama_kv_stream_generation_batch_supported(1, 1, 1, 2));
++        t.assert_true("two active slots", llama_kv_stream_generation_batch_supported(2, 2, 1, 2));
++        t.assert_true("two of four slots", llama_kv_stream_generation_batch_supported(2, 2, 1, 4));
++        t.assert_true("empty batch rejected", !llama_kv_stream_generation_batch_supported(0, 0, 1, 2));
++        t.assert_true("draft tokens rejected", !llama_kv_stream_generation_batch_supported(2, 1, 2, 2));
++        t.assert_true("too many sequences rejected", !llama_kv_stream_generation_batch_supported(3, 3, 1, 2));
++        t.assert_true("shared sequence token rejected", !llama_kv_stream_generation_batch_supported(1, 2, 1, 2));
++    });
++
+     t.test("pool is partitioned evenly across layers with one scratch page", [](testing & t) {
+         const auto layout = llama_kv_stream_pool_layout_make({
+             /*.pool_bytes   =*/ 64ULL*1024ULL*1024ULL,
+diff --git a/tests/test-kv-stream-cuda-attn.cpp b/tests/test-kv-stream-cuda-attn.cpp
+index fab8287..7e9cd6d 100644
+--- a/tests/test-kv-stream-cuda-attn.cpp
++++ b/tests/test-kv-stream-cuda-attn.cpp
+@@ -10,12 +10,34 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <cstdint>
++#include <string>
+ #include <vector>
+ 
+ namespace {
+ 
++struct fp32_reference_scope {
++    std::string previous;
++    bool had_previous;
++    static void set(const char * value) {
++#ifdef _WIN32
++        GGML_ASSERT(_putenv_s("GGML_CUDA_KV_STREAM_FP32_REFERENCE", value ? value : "") == 0);
++#else
++        GGML_ASSERT((value ? setenv("GGML_CUDA_KV_STREAM_FP32_REFERENCE", value, 1) :
++            unsetenv("GGML_CUDA_KV_STREAM_FP32_REFERENCE")) == 0);
++#endif
++    }
++    fp32_reference_scope() {
++        const char * value = std::getenv("GGML_CUDA_KV_STREAM_FP32_REFERENCE");
++        had_previous = value != nullptr;
++        if (value) { previous = value; }
++        set("1");
++    }
++    ~fp32_reference_scope() { set(had_previous ? previous.c_str() : nullptr); }
++};
++
+ constexpr int64_t HEAD_DIM = 256;
+ constexpr int64_t N_KV_HEAD = 4;
+ constexpr int64_t N_Q_HEAD  = 24;
+@@ -405,8 +427,15 @@ std::vector<float> run_attention_layers(
+ 
+ } // namespace
+ 
+-int main() {
++int main(int argc, char ** argv) {
+     testing t;
++    if (argc > 2) {
++        std::fprintf(stderr, "usage: %s [test_regex]\n", argv[0]);
++        return 2;
++    }
++    if (argc == 2) {
++        t.set_filter(argv[1]);
++    }
+ 
+     t.test("decode span tuner selects the faster measured mode per layout", [](testing & t) {
+         ggml_cuda_kv_stream_span_tuner production_tuner;
+@@ -453,6 +482,156 @@ int main() {
+         t.assert_true("selection remains stable until layout reset", !tuner.use_bounded());
+     });
+ 
++    t.test("unified Q5_1 histories remain isolated across dirty rows and holes", [](testing & t) {
++        constexpr int64_t n_kv = 1024;
++        constexpr int64_t n_batch = 2;
++        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
++        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
++            return;
++        }
++        auto inputs = make_inputs(n_kv, n_batch, n_kv - 1, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1);
++        for (int64_t query = 0; query < n_batch; ++query) {
++            for (int64_t row = 0; row < n_kv; ++row) {
++                const bool owned = row % 2 == query;
++                const bool occupied = row < (query == 0 ? 1023 : 513) && row % 31 != 17;
++                inputs.mask[query*n_kv + row] = ggml_fp32_to_fp16(owned && occupied ? 0.0f : -INFINITY);
++            }
++        }
++        auto changed = inputs;
++        const size_t row_bytes = ggml_row_size(GGML_TYPE_Q5_1, HEAD_DIM)*N_KV_HEAD;
++        std::vector<float> changed_values(HEAD_DIM*N_KV_HEAD, 2.0f);
++        std::vector<uint8_t> changed_row(row_bytes);
++        GGML_ASSERT(ggml_quantize_chunk(GGML_TYPE_Q5_1, changed_values.data(),
++            changed_row.data(), 0, N_KV_HEAD, HEAD_DIM, nullptr) == row_bytes);
++        for (int64_t row = 1; row < n_kv; row += 2) {
++            // Only sequence 1's V changes.
++            std::memcpy(changed.v.data() + row*row_bytes, changed_row.data(), row_bytes);
++        }
++        const size_t page_bytes = align_up(row_bytes*256, 128) + row_bytes*256;
++        auto streamed = [&](const attention_inputs & input) {
++            ggml_backend_cuda_kv_stream_params params{};
++            params.device = 0;
++            params.stage_bytes = page_bytes;
++            params.stage_slots = 2;
++            params.pool_bytes = 3*page_bytes;
++            params.resident_layer_count = 1;
++            params.page_tokens = 256;
++            auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
++            if (!t.assert_true("unified test runtime initializes", runtime != nullptr)) {
++                return std::vector<float>{};
++            }
++            auto result = run_attention(
++                backend.get(), input, ggml_backend_cuda_kv_stream_buffer_type(runtime),
++                n_kv, n_batch, 4, 2, true, GGML_TYPE_I64, true, runtime, true);
++            const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
++            t.assert_true("test exceeds resident capacity", stats.streamed_pages > 0);
++            ggml_backend_cuda_kv_stream_runtime_free(runtime);
++            return result;
++        };
++        const auto actual = streamed(inputs);
++        const auto perturbed = streamed(changed);
++        for (int variant = 0; variant < 2; ++variant) {
++            const auto expected = run_attention(
++                backend.get(), variant == 0 ? inputs : changed,
++                ggml_backend_get_default_buffer_type(backend.get()),
++                n_kv, n_batch, 4, 2, true, GGML_TYPE_I64, true, nullptr, true);
++            const auto & output = variant == 0 ? actual : perturbed;
++            if (!t.assert_equal(expected.size(), output.size())) {
++                return;
++            }
++            float max_abs = 0.0f;
++            bool finite = true;
++            for (size_t i = 0; i < output.size(); ++i) {
++                finite &= std::isfinite(output[i]) && std::isfinite(expected[i]);
++                max_abs = std::max(max_abs, std::abs(output[i] - expected[i]));
++            }
++            std::fprintf(stderr, "unified Q5_1 variant=%d max_abs=%g\n", variant, max_abs);
++            t.assert_true("unified output finite and equivalent", finite && max_abs <= 5e-4f);
++        }
++        float isolated_difference = 0.0f;
++        float changed_difference = 0.0f;
++        for (size_t i = 0; i < HEAD_DIM*N_Q_HEAD; ++i) {
++            isolated_difference = std::max(isolated_difference, std::abs(actual[i] - perturbed[i]));
++            changed_difference = std::max(changed_difference,
++                std::abs(actual[i + HEAD_DIM*N_Q_HEAD] - perturbed[i + HEAD_DIM*N_Q_HEAD]));
++        }
++        t.assert_true("other history cannot affect sequence 0", isolated_difference <= 5e-4f);
++        t.assert_true("perturbation affects sequence 1", changed_difference > 0.5f);
++    });
++
++    t.test("Q5_1 prefill preserves constant values across long resident spans", [](testing & t) {
++        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
++        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
++            return;
++        }
++        for (const int64_t n_kv : {int64_t(3072), int64_t(32768)}) {
++            const int64_t n_batch = n_kv == 3072 ? 127 : 128;
++            auto inputs = make_inputs(n_kv, n_batch, 0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1);
++            std::fill(inputs.q.begin(), inputs.q.end(), 0.0f);
++            for (int64_t query = 0; query < n_batch; ++query) {
++                for (int64_t token = 0; token < n_kv; ++token) {
++                    // SET_ROWS changes row 0; exclude it from the analytic answer.
++                    const bool visible = token > 0 && token <= n_kv - n_batch - 1 + query;
++                    inputs.mask[query*n_kv + token] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
++                }
++            }
++            const size_t head_bytes = ggml_row_size(GGML_TYPE_Q5_1, HEAD_DIM);
++            const size_t row_bytes = head_bytes*N_KV_HEAD;
++            std::vector<float> source(HEAD_DIM*N_KV_HEAD);
++            for (int64_t head = 0; head < N_KV_HEAD; ++head) {
++                for (int64_t value = 0; value < HEAD_DIM; ++value) {
++                    source[head*HEAD_DIM + value] = 0.7f + 0.1f*head + 0.005f*(value % 13);
++                }
++            }
++            std::vector<uint8_t> row(row_bytes);
++            GGML_ASSERT(ggml_quantize_chunk(GGML_TYPE_Q5_1, source.data(), row.data(),
++                0, N_KV_HEAD, HEAD_DIM, nullptr) == row_bytes);
++            for (int64_t token = 0; token < n_kv; ++token) {
++                std::memcpy(inputs.v.data() + token*row_bytes, row.data(), row_bytes);
++            }
++            std::vector<float> expected(HEAD_DIM*N_KV_HEAD);
++            for (int64_t head = 0; head < N_KV_HEAD; ++head) {
++                ggml_get_type_traits(GGML_TYPE_Q5_1)->to_float(
++                    row.data() + head*head_bytes, expected.data() + head*HEAD_DIM, HEAD_DIM);
++            }
++            for (float & value : expected) {
++                value = ggml_fp16_to_fp32(ggml_fp32_to_fp16(value));
++            }
++            const size_t page_bytes = align_up(row_bytes*256, 128) + row_bytes*256;
++            ggml_backend_cuda_kv_stream_params params{};
++            params.device = 0;
++            params.stage_bytes = page_bytes;
++            params.stage_slots = 2;
++            params.pool_bytes = (n_kv/256 + 1)*page_bytes;
++            params.resident_layer_count = 1;
++            params.page_tokens = 256;
++            auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
++            if (!t.assert_true("long-span runtime initializes", runtime != nullptr)) {
++                return;
++            }
++            const auto actual = run_attention(backend.get(), inputs,
++                ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch);
++            const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
++            ggml_backend_cuda_kv_stream_runtime_free(runtime);
++            t.assert_true("long-span test executes streamed MMA", stats.mma_prefill_attention_spans > 0 && stats.streamed_pages > 0);
++            if (!t.assert_equal(size_t(HEAD_DIM*N_Q_HEAD*n_batch), actual.size())) {
++                return;
++            }
++            float max_abs = 0.0f;
++            bool finite = true;
++            for (size_t i = 0; i < actual.size(); ++i) {
++                const size_t query_head = (i/HEAD_DIM) % N_Q_HEAD;
++                const size_t kv_head = query_head/(N_Q_HEAD/N_KV_HEAD);
++                const float reference = expected[kv_head*HEAD_DIM + i % HEAD_DIM];
++                finite &= std::isfinite(actual[i]);
++                max_abs = std::max(max_abs, std::abs(actual[i] - reference));
++            }
++            std::fprintf(stderr, "analytic Q5_1 prefill kv=%lld queries=%lld resident=%lld max_abs=%g finite=%d\n",
++                (long long) n_kv, (long long) n_batch, (long long) (n_kv - 256), max_abs, int(finite));
++            t.assert_true("constant values survive long-span prefill", finite && max_abs <= 5e-4f);
++        }
++    });
++
+     t.test("all native CUDA KV pairs preserve streamed prefill results", [](testing & t) {
+         constexpr int64_t n_kv = 512;
+         constexpr int64_t n_batch = 4;
+@@ -725,7 +904,7 @@ int main() {
+         t.assert_true("streamed output is numerically equivalent", max_abs <= 3e-4f);
+     });
+ 
+-    t.test("one-page causal prefill stays bit-identical to ordinary CUDA attention", [](testing & t) {
++    t.test("one-page causal prefill stays bit-identical to resident FP32 attention", [](testing & t) {
+         constexpr int64_t n_kv = 256;
+         constexpr int64_t n_batch = 5;
+         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+@@ -734,8 +913,10 @@ int main() {
+         }
+ 
+         const attention_inputs inputs = make_inputs(n_kv, n_batch);
+-        const std::vector<float> expected = run_attention(
+-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
++        const std::vector<float> expected = [&]() {
++            fp32_reference_scope reference_mode;
++            return run_attention(backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
++        }();
+ 
+         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+         const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+@@ -759,7 +940,7 @@ int main() {
+         t.assert_true("one-page outputs are bit-identical", expected == actual);
+     });
+ 
+-    t.test("fully resident multi-page prefill stays bit-identical to ordinary CUDA attention", [](testing & t) {
++    t.test("fully resident multi-page prefill stays bit-identical to resident FP32 attention", [](testing & t) {
+         constexpr int64_t n_kv = 512;
+         constexpr int64_t n_batch = 4;
+         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+@@ -768,8 +949,10 @@ int main() {
+         }
+ 
+         const attention_inputs inputs = make_inputs(n_kv, n_batch, 340);
+-        const std::vector<float> expected = run_attention(
+-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
++        const std::vector<float> expected = [&]() {
++            fp32_reference_scope reference_mode;
++            return run_attention(backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
++        }();
+ 
+         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+         const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+diff --git a/tests/test-kv-stream-multislot.cpp b/tests/test-kv-stream-multislot.cpp
+new file mode 100644
+index 0000000..a88b443
+--- /dev/null
++++ b/tests/test-kv-stream-multislot.cpp
+@@ -0,0 +1,423 @@
++#include "llama.h"
++#include "ggml-backend.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++// Model-dependent integration test; run through scripts/run_kv_multislot_tests.py.
++namespace {
++using clock_type = std::chrono::steady_clock;
++using tokens = std::vector<llama_token>;
++using logits = std::vector<float>;
++using context_ptr = std::unique_ptr<llama_context, decltype(&llama_free)>;
++
++struct options {
++    std::string model;
++    std::string report;
++    int arena_mib = 2048;
++    int prompt_tokens = 1023;
++    int second_prompt_tokens = 0;
++    int steps = 12;
++    int gpu_layers = 999;
++    int ubatch = 128;
++    double max_abs = 0.15;
++    double max_rmse = 0.02;
++};
++
++struct reference {
++    tokens prompt;
++    tokens continuation;
++    std::vector<logits> output;
++};
++
++struct observation {
++    std::string name;
++    int step;
++    logits values;
++};
++
++struct environment_scope {
++    std::string name;
++    std::string previous;
++    bool had_previous;
++    static int set(const char * name, const char * value) {
++#ifdef _WIN32
++        return _putenv_s(name, value ? value : "");
++#else
++        return value ? setenv(name, value, 1) : unsetenv(name);
++#endif
++    }
++    environment_scope(const char * key, const char * selected) : name(key) {
++        const char * value = std::getenv(key);
++        had_previous = value != nullptr;
++        if (value) { previous = value; }
++        if (set(key, selected) != 0) {
++            throw std::runtime_error("cannot set test environment: " + name);
++        }
++    }
++    ~environment_scope() { set(name.c_str(), had_previous ? previous.c_str() : nullptr); }
++};
++
++struct plan_scope {
++    environment_scope record;
++    environment_scope replay;
++    plan_scope(bool stream, const std::string & path) :
++        record("GGML_CUDA_KV_STREAM_RECORD_PLAN", stream && !path.empty() ? path.c_str() : nullptr),
++        replay("GGML_CUDA_KV_STREAM_REPLAY_PLAN", !stream && !path.empty() ? path.c_str() : nullptr) {
++        if (stream && !path.empty()) {
++            std::ofstream output(path, std::ios::trunc);
++            if (!output) { throw std::runtime_error("cannot create attention plan: " + path); }
++        }
++    }
++};
++
++struct batch_owner {
++    llama_batch batch = llama_batch_init(512, 0, 1);
++    ~batch_owner() { llama_batch_free(batch); }
++    void clear() { batch.n_tokens = 0; }
++    void add(llama_token token, llama_pos pos, llama_seq_id seq, bool output) {
++        const int i = batch.n_tokens++;
++        if (batch.n_tokens > 512) { throw std::runtime_error("test batch overflow"); }
++        batch.token[i] = token;
++        batch.pos[i] = pos;
++        batch.n_seq_id[i] = 1;
++        batch.seq_id[i][0] = seq;
++        batch.logits[i] = output;
++    }
++};
++
++void decode(llama_context * ctx, batch_owner & batch, llama_decode_phase phase) {
++    llama_set_decode_phase(ctx, phase);
++    const int rc = llama_decode(ctx, batch.batch);
++    if (rc != 0) { throw std::runtime_error("llama_decode returned " + std::to_string(rc)); }
++}
++
++logits read_logits(llama_context * ctx, int n_vocab, int index = -1) {
++    const float * data = llama_get_logits_ith(ctx, index);
++    if (!data) { throw std::runtime_error("missing logits"); }
++    return logits(data, data + n_vocab);
++}
++
++llama_token greedy(const logits & values) {
++    return llama_token(std::max_element(values.begin(), values.end()) - values.begin());
++}
++
++tokens prompt(const llama_vocab * vocab, int count, const std::string & text) {
++    tokens seed(text.size()*4 + 32);
++    const int n = llama_tokenize(vocab, text.data(), int(text.size()), seed.data(), int(seed.size()), false, false);
++    if (n <= 0) { throw std::runtime_error("seed tokenization failed"); }
++    seed.resize(n);
++    tokens result;
++    result.reserve(count);
++    if (llama_vocab_get_add_bos(vocab)) { result.push_back(llama_vocab_bos(vocab)); }
++    while (int(result.size()) < count) {
++        result.push_back(seed[result.size() % seed.size()]);
++    }
++    return result;
++}
++
++context_ptr context(llama_model * model, const options & opts, int slots, bool stream) {
++    auto params = llama_context_default_params();
++    params.n_ctx = ((2*(std::max(opts.prompt_tokens, opts.second_prompt_tokens) + opts.steps + 1024) + 511)/512)*512;
++    params.n_batch = 512;
++    params.n_ubatch = opts.ubatch;
++    params.n_seq_max = slots;
++    params.n_outputs_max = slots;
++    params.n_outputs_max_per_seq = 1;
++    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++    params.type_k = params.type_v = GGML_TYPE_Q5_1;
++    params.kv_unified = true;
++    params.offload_kqv = true;
++    params.kv_stream_arena_mib = stream ? opts.arena_mib : 0;
++    context_ptr ctx(llama_init_from_model(model, params), llama_free);
++    if (!ctx) { throw std::runtime_error("context creation failed"); }
++    return ctx;
++}
++
++logits prefill(llama_context * ctx, batch_owner & batch, const tokens & input,
++        llama_seq_id seq, int n_vocab, int start = 0) {
++    const auto started = clock_type::now();
++    auto last_report = started;
++    std::fprintf(stderr, "kv-multislot progress: prompt seq=%d tokens=%zu start=%d\n", seq, input.size(), start);
++    for (int pos = start; pos < int(input.size());) {
++        batch.clear();
++        // An odd chunk size also exercises the one-token final prompt tail.
++        const int end = std::min(pos + 511, int(input.size()));
++        for (; pos < end; ++pos) {
++            batch.add(input[pos], pos, seq, pos + 1 == int(input.size()));
++        }
++        decode(ctx, batch, LLAMA_DECODE_PHASE_PROMPT);
++        const auto now = clock_type::now();
++        if (now - last_report >= std::chrono::seconds(30) || pos == int(input.size())) {
++            const double elapsed = std::chrono::duration<double>(now - started).count();
++            std::fprintf(stderr, "kv-multislot progress: prompt seq=%d %d/%zu tokens elapsed=%.1fs rate=%.1f tok/s\n",
++                seq, pos, input.size(), elapsed, (pos - start)/std::max(elapsed, 1e-6));
++            last_report = now;
++        }
++    }
++    return read_logits(ctx, n_vocab);
++}
++
++reference serial(llama_model * model, const options & opts, tokens input,
++        bool stream, const reference * forced = nullptr, bool fp32_reference = true, const std::string & plan = {}) {
++    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
++    environment_scope reference_mode("GGML_CUDA_KV_STREAM_FP32_REFERENCE", !stream && fp32_reference && plan.empty() ? "1" : nullptr);
++    plan_scope arithmetic_plan(stream, plan);
++    auto ctx = context(model, opts, 1, stream);
++    batch_owner batch;
++    reference result;
++    result.prompt = std::move(input);
++    result.output.push_back(prefill(ctx.get(), batch, result.prompt, 0, n_vocab));
++    for (int step = 0; step < opts.steps; ++step) {
++        const llama_token token = forced ? forced->continuation[step] : greedy(result.output.back());
++        result.continuation.push_back(token);
++        batch.clear();
++        batch.add(token, int(result.prompt.size()) + step, 0, true);
++        decode(ctx.get(), batch, LLAMA_DECODE_PHASE_GENERATION);
++        result.output.push_back(read_logits(ctx.get(), n_vocab));
++    }
++    return result;
++}
++
++struct comparisons {
++    const options & opts;
++    std::ofstream report;
++    int failures = 0;
++    explicit comparisons(const options & opts) : opts(opts), report(opts.report) {
++        if (!report) { throw std::runtime_error("cannot open comparison report"); }
++        report << "case,step,max_abs,rmse,reference_top,actual_top,pass,required\n";
++    }
++    void check(const std::string & name, int step, const logits & expected, const logits & actual, bool required = true) {
++        if (expected.size() != actual.size()) { throw std::runtime_error("logit size mismatch"); }
++        double max_abs = 0;
++        double squared = 0;
++        bool finite = true;
++        for (size_t i = 0; i < expected.size(); ++i) {
++            finite &= std::isfinite(actual[i]) && std::isfinite(expected[i]);
++            const double difference = double(actual[i]) - expected[i];
++            max_abs = std::max(max_abs, std::abs(difference));
++            squared += difference*difference;
++        }
++        const double rmse = std::sqrt(squared/expected.size());
++        const bool pass = finite && max_abs <= opts.max_abs && rmse <= opts.max_rmse;
++        failures += required && !pass;
++        report << name << ',' << step << ',' << max_abs << ',' << rmse << ','
++               << greedy(expected) << ',' << greedy(actual) << ',' << pass << ',' << required << '\n';
++        report.flush();
++        std::fprintf(stderr, "%s step=%d max_abs=%.6g rmse=%.6g %s%s\n",
++            name.c_str(), step, max_abs, rmse, pass ? "PASS" : "FAIL", required ? "" : " (diagnostic)");
++    }
++};
++
++std::vector<observation> parallel(llama_model * model, const options & opts,
++        const std::vector<reference> & refs, comparisons & checks, bool stream,
++        const std::vector<observation> * streamed = nullptr, const std::string & plan = {}) {
++    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
++    environment_scope reference_mode("GGML_CUDA_KV_STREAM_FP32_REFERENCE", !stream && plan.empty() ? "1" : nullptr);
++    plan_scope arithmetic_plan(stream, plan);
++    auto ctx = context(model, opts, 2, stream);
++    std::vector<observation> outputs;
++    const std::string prefix = stream ? "streamed_" : "partition_resident_";
++    auto check = [&](const std::string & name, int step, const logits & serial_output, const logits & actual) {
++        // Same batching separates arena regressions from serial/parallel kernel differences.
++        checks.check(prefix + "serial_vs_" + name, step, serial_output, actual, stream && plan.empty());
++        if (streamed) {
++            const size_t i = outputs.size();
++            if (stream || i >= streamed->size() || (*streamed)[i].name != name || (*streamed)[i].step != step) {
++                throw std::runtime_error("resident parallel observation mismatch");
++            }
++            checks.check("partition_resident_parallel_vs_streamed_" + name, step, actual, (*streamed)[i].values);
++        }
++        outputs.push_back({ name, step, actual });
++    };
++    batch_owner batch;
++    std::vector<logits> initial(2);
++    int positions[2] = { 0, 0 };
++    const auto started = clock_type::now();
++    auto last_report = started;
++    std::fprintf(stderr, "kv-multislot progress: %s parallel prompts total=%zu tokens\n", prefix.c_str(), refs[0].prompt.size() + refs[1].prompt.size());
++    // Interleave prompt chunks so each history occupies scattered shared cells.
++    while (positions[0] < int(refs[0].prompt.size()) || positions[1] < int(refs[1].prompt.size())) {
++        for (int seq = 0; seq < 2; ++seq) {
++            if (positions[seq] == int(refs[seq].prompt.size())) { continue; }
++            batch.clear();
++            const int end = std::min(positions[seq] + 511, int(refs[seq].prompt.size()));
++            while (positions[seq] < end) {
++                const int pos = positions[seq]++;
++                batch.add(refs[seq].prompt[pos], pos, seq, positions[seq] == int(refs[seq].prompt.size()));
++            }
++            decode(ctx.get(), batch, LLAMA_DECODE_PHASE_PROMPT);
++            if (positions[seq] == int(refs[seq].prompt.size())) { initial[seq] = read_logits(ctx.get(), n_vocab); }
++        }
++        const auto now = clock_type::now();
++        if (now - last_report >= std::chrono::seconds(30) ||
++                positions[0] + positions[1] == int(refs[0].prompt.size() + refs[1].prompt.size())) {
++            const double elapsed = std::chrono::duration<double>(now - started).count();
++            std::fprintf(stderr, "kv-multislot progress: parallel seq0=%d/%zu seq1=%d/%zu elapsed=%.1fs rate=%.1f tok/s\n",
++                positions[0], refs[0].prompt.size(), positions[1], refs[1].prompt.size(), elapsed,
++                (positions[0] + positions[1])/std::max(elapsed, 1e-6));
++            last_report = now;
++        }
++    }
++    check("parallel_prefill_0", 0, refs[0].output[0], initial[0]);
++    check("parallel_prefill_1", 0, refs[1].output[0], initial[1]);
++    std::vector<uint8_t> checkpoint;
++    int reused_step = 0;
++    for (int step = 1; step <= opts.steps; ++step) {
++        if (step == 5) {
++            if (std::max(opts.prompt_tokens, opts.second_prompt_tokens) <= 4096) {
++                checkpoint.resize(llama_state_seq_get_size(ctx.get(), 1));
++                if (checkpoint.empty() || llama_state_seq_get_data(
++                        ctx.get(), checkpoint.data(), checkpoint.size(), 1) != checkpoint.size()) {
++                    throw std::runtime_error("sequence checkpoint failed");
++                }
++            }
++            if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1)) {
++                throw std::runtime_error("slot removal failed");
++            }
++        }
++        batch.clear();
++        if (step == 8) {
++            // Refill slot 0 while slot 1 contributes its next generation token.
++            const int end = std::min(127, int(refs[2].prompt.size()));
++            for (int pos = 0; pos < end; ++pos) { batch.add(refs[2].prompt[pos], pos, 0, false); }
++            const int output_index = batch.batch.n_tokens;
++            batch.add(refs[1].continuation[step - 1], int(refs[1].prompt.size()) + step - 1, 1, true);
++            decode(ctx.get(), batch, LLAMA_DECODE_PHASE_AUTOMATIC);
++            check("mixed_generation_1", step, refs[1].output[step], read_logits(ctx.get(), n_vocab, output_index));
++            const auto output = prefill(ctx.get(), batch, refs[2].prompt, 0, n_vocab, end);
++            check("reused_slot_prefill_0", 0, refs[2].output[0], output);
++            continue;
++        }
++        int output0 = -1;
++        if (step <= 4 || step > 8) {
++            const reference & ref = refs[step <= 4 ? 0 : 2];
++            const int local_step = step <= 4 ? step : ++reused_step;
++            output0 = batch.batch.n_tokens;
++            batch.add(ref.continuation[local_step - 1], int(ref.prompt.size()) + local_step - 1, 0, true);
++        }
++        const int output1 = batch.batch.n_tokens;
++        batch.add(refs[1].continuation[step - 1], int(refs[1].prompt.size()) + step - 1, 1, true);
++        decode(ctx.get(), batch, LLAMA_DECODE_PHASE_GENERATION);
++        if (output0 >= 0) {
++            check(step <= 4 ? "parallel_generation_0" : "reused_slot_generation_0",
++                step <= 4 ? step : reused_step, refs[step <= 4 ? 0 : 2].output[step <= 4 ? step : reused_step],
++                read_logits(ctx.get(), n_vocab, output0));
++        }
++        check(step <= 4 || step > 8 ? "parallel_generation_1" : "single_active_slot_1",
++            step, refs[1].output[step], read_logits(ctx.get(), n_vocab, output1));
++    }
++    if (!checkpoint.empty()) {
++        if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 1, -1, -1) ||
++                llama_state_seq_set_data(ctx.get(), checkpoint.data(), checkpoint.size(), 1) != checkpoint.size()) {
++            throw std::runtime_error("sequence restore failed");
++        }
++        batch.clear();
++        batch.add(refs[1].continuation[4], int(refs[1].prompt.size()) + 4, 1, true);
++        decode(ctx.get(), batch, LLAMA_DECODE_PHASE_GENERATION);
++        check("restored_slot_1", 5, refs[1].output[5], read_logits(ctx.get(), n_vocab));
++        batch.clear();
++        batch.add(refs[2].continuation[reused_step], int(refs[2].prompt.size()) + reused_step, 0, true);
++        decode(ctx.get(), batch, LLAMA_DECODE_PHASE_GENERATION);
++        check("restore_preserves_other_slot_0", reused_step + 1,
++            refs[2].output[reused_step + 1], read_logits(ctx.get(), n_vocab));
++    }
++    if (streamed && outputs.size() != streamed->size()) {
++        throw std::runtime_error("missing resident parallel observations");
++    }
++    return outputs;
++}
++} // namespace
++
++int main(int argc, char ** argv) {
++    try {
++        options opts;
++        for (int i = 1; i < argc; i += 2) {
++            if (i + 1 >= argc) { throw std::runtime_error("missing option value"); }
++            const std::string key = argv[i];
++            const std::string value = argv[i + 1];
++            if      (key == "--model")         { opts.model = value; }
++            else if (key == "--report")        { opts.report = value; }
++            else if (key == "--arena-mib")     { opts.arena_mib = std::stoi(value); }
++            else if (key == "--prompt-tokens") { opts.prompt_tokens = std::stoi(value); }
++            else if (key == "--second-prompt-tokens") { opts.second_prompt_tokens = std::stoi(value); }
++            else if (key == "--steps")         { opts.steps = std::stoi(value); }
++            else if (key == "--gpu-layers")    { opts.gpu_layers = std::stoi(value); }
++            else if (key == "--ubatch")        { opts.ubatch = std::stoi(value); }
++            else if (key == "--max-abs")       { opts.max_abs = std::stod(value); }
++            else if (key == "--max-rmse")      { opts.max_rmse = std::stod(value); }
++            else { throw std::runtime_error("unknown option: " + key); }
++        }
++        if (opts.second_prompt_tokens == 0) { opts.second_prompt_tokens = opts.prompt_tokens - 257; }
++        if (opts.model.empty() || opts.report.empty() || opts.arena_mib <= 0 ||
++                opts.prompt_tokens < 512 || opts.prompt_tokens > 1000000 || opts.steps < 10 ||
++                opts.second_prompt_tokens < 128 || opts.second_prompt_tokens > 1000000 ||
++                opts.steps > 128 || opts.ubatch < 2 || opts.ubatch > 512 ||
++                !(opts.max_abs > 0) || !(opts.max_rmse > 0)) {
++            throw std::runtime_error("invalid options: require --model GGUF --report CSV, positive arena, prompt 512..1000000, steps 10..128, ubatch 2..512");
++        }
++        // Capture every attention operation, including repeated generation graphs.
++        environment_scope disable_graphs("GGML_CUDA_DISABLE_GRAPHS", "1");
++        ggml_backend_load_all();
++        llama_backend_init();
++        auto params = llama_model_default_params();
++        params.n_gpu_layers = opts.gpu_layers;
++        params.load_mtp = false;
++        std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
++            llama_model_load_from_file(opts.model.c_str(), params), llama_model_free);
++        if (!model) { throw std::runtime_error("model load failed"); }
++        const auto * vocab = llama_model_get_vocab(model.get());
++        const tokens inputs[] = {
++            prompt(vocab, opts.prompt_tokens, "Amber notebook. The observatory records stars and quiet weather. "),
++            prompt(vocab, opts.second_prompt_tokens, "Blue notebook. The workshop records engines and loud machines. "),
++            prompt(vocab, 779, "Green notebook. A new visitor asks about rivers, maps and bridges. "),
++        };
++        comparisons checks(opts);
++        std::vector<reference> refs;
++        const bool short_run = std::max(opts.prompt_tokens, opts.second_prompt_tokens) <= 4096;
++        for (int seq = 0; seq < 3; ++seq) {
++            std::fprintf(stderr, "kv-multislot progress: serial reference %d/3 prompt=%zu tokens\n", seq + 1, inputs[seq].size());
++            const std::string plan = short_run ? opts.report + ".serial-" + std::to_string(seq) + ".plan" : "";
++            auto ref = serial(model.get(), opts, inputs[seq], true, nullptr, false, plan);
++            // A resident reference is affordable only for the short run.
++            if (short_run) {
++                const auto partition_resident = serial(model.get(), opts, inputs[seq], false, &ref, false, plan);
++                for (int step = 0; step <= opts.steps; ++step) {
++                    checks.check("partition_resident_vs_streamed_" + std::to_string(seq), step,
++                        partition_resident.output[step], ref.output[step]);
++                }
++                const auto resident = serial(model.get(), opts, inputs[seq], false, &ref);
++                for (int step = 0; step <= opts.steps; ++step) {
++                    checks.check("fp32_resident_vs_streamed_" + std::to_string(seq), step, resident.output[step], ref.output[step], false);
++                }
++                const auto stock = serial(model.get(), opts, inputs[seq], false, &ref, false);
++                for (int step = 0; step <= opts.steps; ++step) {
++                    checks.check("stock_resident_vs_streamed_" + std::to_string(seq), step, stock.output[step], ref.output[step], false);
++                }
++            }
++            refs.push_back(std::move(ref));
++        }
++        if (short_run) {
++            const std::string plan = opts.report + ".parallel.plan";
++            const auto streamed = parallel(model.get(), opts, refs, checks, true, nullptr, plan);
++            parallel(model.get(), opts, refs, checks, false, &streamed, plan);
++        } else {
++            parallel(model.get(), opts, refs, checks, true);
++        }
++        std::fprintf(stderr, "multislot result: %d comparison failures; long runs omit large state snapshots\n", checks.failures);
++        model.reset();
++        llama_backend_free();
++        return checks.failures ? 1 : 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "multislot test failed: %s\n", error.what());
++        return 1;
++    }
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index dd88401..3aca61d 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1022,6 +1022,12 @@ private:
+                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+         const bool has_spec = has_draft || spec_mtp;
+ 
++        if (params_base.kv_stream_arena_mib > 0 && params_base.n_parallel > 1 &&
++                common_speculative_n_max(&params_base.speculative) > 0) {
++            SRV_ERR("%s", "parallel block KV streaming does not support speculative decoding\n");
++            return false;
++        }
++
+         if (callback_state) {
+             std::vector<std::string> stages = {"text_model"};
+             if (has_spec) {

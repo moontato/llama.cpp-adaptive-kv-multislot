@@ -903,7 +903,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
 
 #if defined(TURING_MMA_AVAILABLE)
-        if constexpr (cols_per_warp == 8) {
+        if constexpr (std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]>) {
+#pragma unroll
+            for (int i = 0; i < DV/T_C_VKQ::J; ++i) {
+#pragma unroll
+                for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                    VKQ_C[i].x[l] *= KQ_max_scale[(l/2) % cols_per_thread];
+                }
+            }
+        } else if constexpr (cols_per_warp == 8) {
             const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[cols_per_thread - 1]);
 #pragma unroll
             for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
@@ -1190,7 +1198,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     using     T_C_KQ    = typename mma_tile_sizes<DV, ncols>::T_C_KQ;
     using     T_A_VKQ   = typename mma_tile_sizes<DV, ncols>::T_A_VKQ;
     using     T_B_VKQ   = typename mma_tile_sizes<DV, ncols>::T_B_VKQ;
-    using     T_C_VKQ   = typename mma_tile_sizes<DV, ncols>::T_C_VKQ;
+    using     T_C_VKQ_base = typename mma_tile_sizes<DV, ncols>::T_C_VKQ;
+#if defined(TURING_MMA_AVAILABLE)
+    constexpr bool fp32_partial = output_partial && !needs_fixup && !is_fixup && DKQ == 256 && DV == 256 &&
+        ncols == 64 && nwarps*T_B_KQ::I == ncols;
+    using T_C_VKQ = std::conditional_t<fp32_partial, tile<16, 16, float>, T_C_VKQ_base>;
+#else
+    constexpr bool fp32_partial = false;
+    using T_C_VKQ = T_C_VKQ_base;
+#endif // defined(TURING_MMA_AVAILABLE)
 
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
@@ -1224,7 +1240,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
 #if defined(TURING_MMA_AVAILABLE)
-    T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
+    T_C_VKQ VKQ_C[fp32_partial ? DV/T_C_VKQ::J : (cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J))];
 #elif defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
     T_C_VKQ VKQ_C[DV % 32 != 0       ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J)];
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
@@ -1413,7 +1429,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         }
 
 #if defined(TURING_MMA_AVAILABLE)
-        if constexpr (cols_per_warp == 8) {
+        if constexpr (fp32_partial) {
+#pragma unroll
+            for (int i = 0; i < DV/T_C_VKQ::J; ++i) {
+#pragma unroll
+                for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                    VKQ_C[i].x[l] *= KQ_max_scale[(l/2) % cols_per_thread];
+                }
+            }
+        } else if constexpr (cols_per_warp == 8) {
             const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[cols_per_thread - 1]);
 #pragma unroll
             for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
@@ -1509,7 +1533,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         // KQ_cmr = KQ combine max rowsum
         // Use the 16 bytes of padding in each Q column to store the meta data: KQ max, KQ rowsum, KQ max scale.
 #if defined(TURING_MMA_AVAILABLE)
-        const int jc_cwm = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(threadIdx.x % 4);
+        const int jc_cwm = threadIdx.y*cols_per_warp + T_C_VKQ_base::get_i(threadIdx.x % 4);
         const float2 KQ_cmr = make_float2(KQ_max[threadIdx.x % cols_per_thread], KQ_rowsum[threadIdx.x % cols_per_thread]);
         const bool thread_should_write = threadIdx.x % 4 < cols_per_thread;
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
@@ -1616,6 +1640,31 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         // Therefore, all other warps also need to execute a __syncthreads().
         // Otherwise the points at which warps synchronize with each other would become misaligned.
         __syncthreads();
+    }
+
+    if constexpr (fp32_partial) {
+        static_assert(np == 1 && !needs_fixup && !is_fixup, "FP32 partial output requires complete tiles");
+        // Keep long-span numerators in FP32 through the global softmax merge.
+#pragma unroll
+        for (int i = 0; i < DV/T_C_VKQ::J; ++i) {
+#pragma unroll
+            for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                const int jc = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(l);
+                const int query = jt*ncols1 + jc/ncols2;
+                const int head = jc % ncols2;
+                if (query >= int(ne01.z) || zt_gqa*ncols2 + head >= gqa_ratio) {
+                    continue;
+                }
+                const int row = query*ne02 + head;
+                const int value = i*T_C_VKQ::J + T_C_VKQ::get_j(l);
+                reinterpret_cast<float *>(dstk)[row*DV + value] = VKQ_C[i].x[l];
+                if (value == 0) {
+                    const float * meta = reinterpret_cast<const float *>(tile_Q) + jc*tile_stride + nbatch_combine;
+                    dstk_fixup[row] = make_float2(meta[0], meta[1]);
+                }
+            }
+        }
+        return;
     }
 
 #pragma unroll
